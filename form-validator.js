@@ -18,6 +18,16 @@
     ERROR: 'error'
   };
 
+  var STEP_STATUS = {
+    PENDING: 'pending',
+    IN_PROGRESS: 'in_progress',
+    COMPLETED: 'completed',
+    ERROR: 'error',
+    LOCKED: 'locked'
+  };
+
+  var SCHEMA_VERSION = '2.0.0';
+
   var BUILTIN_RULES = {
     name: {
       type: 'name',
@@ -113,23 +123,35 @@
     this.groups = {};
     this.fieldValues = {};
     this.fieldStatus = {};
+    this.fieldMetas = {};
     this.lastSummary = null;
     this.summaryStorageKey = options.summaryStorageKey || 'form_validator_last_summary';
     this.customRules = {};
     this.onFieldValidate = options.onFieldValidate || null;
     this.onFormValidate = options.onFormValidate || null;
     this.onAsyncFieldValidate = options.onAsyncFieldValidate || null;
+    this.onFieldChange = options.onFieldChange || null;
+    this.onDependencyChange = options.onDependencyChange || null;
     this.locale = options.locale || 'zh-CN';
     this.enableSummaryPersistence = options.enableSummaryPersistence !== false;
     this.defaultDebounce = options.defaultDebounce !== undefined ? options.defaultDebounce : 300;
     this._asyncTimers = {};
     this._asyncRequestId = {};
     this._asyncResults = {};
+    this.steps = {};
+    this.stepOrder = [];
+    this.currentStep = null;
+    this._dependencies = {};
+    this._derivedFields = [];
+    this._changeTimers = {};
+    this.schemaChangeLog = [];
   }
 
   FormValidator.SEVERITY = SEVERITY;
   FormValidator.BUILTIN_RULES = BUILTIN_RULES;
   FormValidator.VALIDATE_STATUS = VALIDATE_STATUS;
+  FormValidator.STEP_STATUS = STEP_STATUS;
+  FormValidator.SCHEMA_VERSION = SCHEMA_VERSION;
 
   FormValidator.prototype.registerField = function (fieldName, config) {
     if (!fieldName || typeof fieldName !== 'string') {
@@ -153,10 +175,48 @@
         this.groups[ruleConfig.group].push(fieldName);
       }
     }
+    if (ruleConfig.step) {
+      if (!this.steps[ruleConfig.step]) {
+        this.steps[ruleConfig.step] = {
+          name: ruleConfig.step,
+          label: ruleConfig.stepLabel || ruleConfig.step,
+          fields: [],
+          status: STEP_STATUS.PENDING,
+          description: '',
+          weight: 1
+        };
+        this.stepOrder.push(ruleConfig.step);
+      }
+      if (this.steps[ruleConfig.step].fields.indexOf(fieldName) === -1) {
+        this.steps[ruleConfig.step].fields.push(fieldName);
+      }
+    }
+    if (ruleConfig.dependsOn && ruleConfig.dependsOn.length > 0) {
+      for (var d = 0; d < ruleConfig.dependsOn.length; d++) {
+        var depField = ruleConfig.dependsOn[d];
+        if (!this._dependencies[depField]) {
+          this._dependencies[depField] = [];
+        }
+        if (this._dependencies[depField].indexOf(fieldName) === -1) {
+          this._dependencies[depField].push(fieldName);
+        }
+      }
+    }
+    if (ruleConfig.deriveValue && typeof ruleConfig.deriveValue === 'function') {
+      if (this._derivedFields.indexOf(fieldName) === -1) {
+        this._derivedFields.push(fieldName);
+      }
+    }
     this.fields[fieldName] = ruleConfig;
     this.errors[fieldName] = [];
     this.warnings[fieldName] = [];
     this.fieldStatus[fieldName] = VALIDATE_STATUS.PENDING;
+    this.fieldMetas[fieldName] = {
+      initialValue: ruleConfig.defaultValue !== undefined ? ruleConfig.defaultValue : undefined,
+      options: ruleConfig.options || null,
+      label: ruleConfig.label,
+      disabled: ruleConfig.disabled || false
+    };
     return this;
   };
 
@@ -187,6 +247,13 @@
     var field = this.fields[fieldName];
     if (!field) {
       return { valid: true, errors: [], warnings: [], field: fieldName };
+    }
+    var meta = this.fieldMetas[fieldName];
+    if (meta && meta.disabled) {
+      this.errors[fieldName] = [];
+      this.warnings[fieldName] = [];
+      this.fieldStatus[fieldName] = VALIDATE_STATUS.SUCCESS;
+      return { valid: true, errors: [], warnings: [], field: fieldName, disabled: true };
     }
     if (typeof value === 'undefined') {
       value = this.fieldValues[fieldName];
@@ -493,6 +560,7 @@
     if (this.onFormValidate && typeof this.onFormValidate === 'function') {
       this.onFormValidate(summary);
     }
+    this._updateStepsFromSummary(summary);
     return summary;
   };
 
@@ -538,16 +606,29 @@
   };
 
   FormValidator.prototype.setFieldValue = function (fieldName, value) {
+    var oldValue = this.fieldValues[fieldName];
     this.fieldValues[fieldName] = value;
+    if (oldValue !== value) {
+      this._triggerFieldChange(fieldName, value, oldValue);
+    }
     return this;
   };
 
   FormValidator.prototype.setValues = function (values) {
     if (values && typeof values === 'object') {
+      var changedFields = [];
       for (var key in values) {
         if (values.hasOwnProperty(key)) {
-          this.fieldValues[key] = values[key];
+          var oldVal = this.fieldValues[key];
+          var newVal = values[key];
+          this.fieldValues[key] = newVal;
+          if (oldVal !== newVal) {
+            changedFields.push(key);
+          }
         }
+      }
+      for (var i = 0; i < changedFields.length; i++) {
+        this._triggerFieldChange(changedFields[i], this.fieldValues[changedFields[i]]);
       }
     }
     return this;
@@ -746,6 +827,7 @@
           if (field.required && this._isEmpty(value)) {
             isIncomplete = true;
           } else if (!this._isEmpty(value)) {
+            this.validateField(fieldName, value);
             var fieldErrors = this.errors[fieldName] || [];
             if (fieldErrors.length > 0) {
               isIncomplete = true;
@@ -829,14 +911,23 @@
     return Object.keys(this.groups);
   };
 
-  FormValidator.prototype.exportSchema = function () {
+  FormValidator.prototype.exportSchema = function (options) {
+    options = options || {};
     var schema = {
-      version: '1.0',
+      schemaVersion: SCHEMA_VERSION,
+      version: SCHEMA_VERSION,
+      appVersion: options.appVersion || '1.0.0',
+      createdAt: new Date().toISOString(),
+      changeDescription: options.changeDescription || '',
       locale: this.locale,
       defaultDebounce: this.defaultDebounce,
       groups: deepClone(this.groups),
       fields: {},
-      customRules: []
+      customRules: [],
+      steps: {},
+      stepOrder: this.stepOrder.slice(),
+      dependencies: deepClone(this._dependencies),
+      derivedFields: this._derivedFields.slice()
     };
     for (var fieldName in this.fields) {
       if (this.fields.hasOwnProperty(fieldName)) {
@@ -850,6 +941,8 @@
         }
         delete fieldConfig.validator;
         delete fieldConfig.asyncValidator;
+        delete fieldConfig.deriveValue;
+        delete fieldConfig.onDependencyChange;
         delete fieldConfig.name;
         schema.fields[fieldName] = fieldConfig;
       }
@@ -862,6 +955,19 @@
         });
       }
     }
+    for (var si = 0; si < this.stepOrder.length; si++) {
+      var stepName = this.stepOrder[si];
+      var step = this.steps[stepName];
+      if (step) {
+        schema.steps[stepName] = {
+          name: step.name,
+          label: step.label,
+          description: step.description,
+          fields: step.fields ? step.fields.slice() : [],
+          weight: step.weight
+        };
+      }
+    }
     return schema;
   };
 
@@ -870,6 +976,13 @@
       throw new Error('Schema 不能为空');
     }
     options = options || {};
+    var importVersion = schema.schemaVersion || schema.version;
+    var strict = options.strict === true;
+    if (importVersion && !this._isSchemaCompatible(importVersion)) {
+      if (strict) {
+        throw new Error('Schema 版本不兼容：当前版本 ' + SCHEMA_VERSION + '，导入版本 ' + importVersion);
+      }
+    }
     if (options.reset !== false) {
       this.reset();
     }
@@ -878,6 +991,49 @@
     }
     if (schema.defaultDebounce !== undefined) {
       this.defaultDebounce = schema.defaultDebounce;
+    }
+    if (schema.groups && typeof schema.groups === 'object') {
+      for (var gName in schema.groups) {
+        if (schema.groups.hasOwnProperty(gName)) {
+          this.groups[gName] = schema.groups[gName].slice ? schema.groups[gName].slice() : [];
+        }
+      }
+    }
+    if (schema.steps) {
+      if (Array.isArray(schema.steps)) {
+        for (var si = 0; si < schema.steps.length; si++) {
+          var stepConfig = schema.steps[si];
+          if (stepConfig && stepConfig.name) {
+            this.registerStep(stepConfig.name, {
+              label: stepConfig.label,
+              description: stepConfig.description,
+              fields: stepConfig.fields,
+              weight: stepConfig.weight
+            });
+          }
+        }
+      } else if (typeof schema.steps === 'object') {
+        var stepOrderList = schema.stepOrder || [];
+        if (stepOrderList.length === 0) {
+          for (var sName in schema.steps) {
+            if (schema.steps.hasOwnProperty(sName)) {
+              stepOrderList.push(sName);
+            }
+          }
+        }
+        for (var sj = 0; sj < stepOrderList.length; sj++) {
+          var sKey = stepOrderList[sj];
+          var sConfig = schema.steps[sKey];
+          if (sConfig) {
+            this.registerStep(sKey, {
+              label: sConfig.label,
+              description: sConfig.description,
+              fields: sConfig.fields,
+              weight: sConfig.weight
+            });
+          }
+        }
+      }
     }
     if (schema.fields && typeof schema.fields === 'object') {
       for (var fieldName in schema.fields) {
@@ -890,6 +1046,16 @@
         }
       }
     }
+    if (schema.dependencies && typeof schema.dependencies === 'object') {
+      for (var depKey in schema.dependencies) {
+        if (schema.dependencies.hasOwnProperty(depKey)) {
+          this._dependencies[depKey] = schema.dependencies[depKey].slice ? schema.dependencies[depKey].slice() : [];
+        }
+      }
+    }
+    if (schema.derivedFields && Array.isArray(schema.derivedFields)) {
+      this._derivedFields = schema.derivedFields.slice();
+    }
     return this;
   };
 
@@ -900,11 +1066,19 @@
     this.groups = {};
     this.fieldValues = {};
     this.fieldStatus = {};
+    this.fieldMetas = {};
     this.lastSummary = null;
     this.customRules = {};
     this._asyncTimers = {};
     this._asyncRequestId = {};
     this._asyncResults = {};
+    this.steps = {};
+    this.stepOrder = [];
+    this.currentStep = null;
+    this._dependencies = {};
+    this._derivedFields = [];
+    this._changeTimers = {};
+    this.schemaChangeLog = [];
     return this;
   };
 
@@ -1373,6 +1547,572 @@
       }
     } catch (e) {}
     return null;
+  };
+
+  FormValidator.prototype._triggerFieldChange = function (fieldName, value, oldValue) {
+    var self = this;
+    var field = this.fields[fieldName];
+    if (this.onFieldChange && typeof this.onFieldChange === 'function') {
+      try {
+        this.onFieldChange({
+          field: fieldName,
+          value: value,
+          oldValue: oldValue,
+          label: field ? field.label : fieldName
+        });
+      } catch (e) {}
+    }
+    var debounceMs = field && field.debounce !== undefined ? field.debounce : this.defaultDebounce;
+    if (this._changeTimers[fieldName]) {
+      clearTimeout(this._changeTimers[fieldName]);
+    }
+    this._changeTimers[fieldName] = setTimeout(function () {
+      self._processDependencies(fieldName, value);
+    }, debounceMs);
+  };
+
+  FormValidator.prototype._processDependencies = function (fieldName, value) {
+    var dependents = this._dependencies[fieldName];
+    if (!dependents || dependents.length === 0) {
+      return;
+    }
+    for (var i = 0; i < dependents.length; i++) {
+      var depField = dependents[i];
+      var depFieldConfig = this.fields[depField];
+      if (!depFieldConfig) continue;
+      if (depFieldConfig.deriveValue && typeof depFieldConfig.deriveValue === 'function') {
+        try {
+          var derivedValue = depFieldConfig.deriveValue(this.fieldValues, this.fields);
+          var oldDerivedValue = this.fieldValues[depField];
+          if (derivedValue !== oldDerivedValue) {
+            this.fieldValues[depField] = derivedValue;
+            if (this.onDependencyChange && typeof this.onDependencyChange === 'function') {
+              this.onDependencyChange({
+                field: depField,
+                value: derivedValue,
+                sourceField: fieldName,
+                sourceValue: value
+              });
+            }
+          }
+        } catch (e) {}
+      }
+    }
+  };
+
+  FormValidator.prototype.updateFieldOptions = function (fieldName, options) {
+    var field = this.fields[fieldName];
+    if (!field) return this;
+    field.options = options;
+    if (this.fieldMetas[fieldName]) {
+      this.fieldMetas[fieldName].options = options;
+    }
+    return this;
+  };
+
+  FormValidator.prototype.updateFieldLabel = function (fieldName, label) {
+    var field = this.fields[fieldName];
+    if (!field) return this;
+    field.label = label;
+    if (this.fieldMetas[fieldName]) {
+      this.fieldMetas[fieldName].label = label;
+    }
+    return this;
+  };
+
+  FormValidator.prototype.updateFieldMessage = function (fieldName, rule, message) {
+    var field = this.fields[fieldName];
+    if (!field) return this;
+    if (!field.message) {
+      field.message = {};
+    }
+    field.message[rule] = message;
+    return this;
+  };
+
+  FormValidator.prototype.setFieldDisabled = function (fieldName, disabled) {
+    if (this.fieldMetas[fieldName]) {
+      this.fieldMetas[fieldName].disabled = disabled;
+    }
+    if (this.fields[fieldName]) {
+      this.fields[fieldName].disabled = disabled;
+    }
+    return this;
+  };
+
+  FormValidator.prototype.getFieldMeta = function (fieldName) {
+    return this.fieldMetas[fieldName] || null;
+  };
+
+  FormValidator.prototype.registerStep = function (stepName, config) {
+    if (!stepName || typeof stepName !== 'string') {
+      throw new Error('步骤名不能为空且必须为字符串');
+    }
+    config = config || {};
+    var stepConfig = {
+      name: stepName,
+      label: config.label || stepName,
+      description: config.description || '',
+      fields: config.fields || [],
+      weight: config.weight !== undefined ? config.weight : 1,
+      status: STEP_STATUS.PENDING
+    };
+    this.steps[stepName] = stepConfig;
+    if (this.stepOrder.indexOf(stepName) === -1) {
+      this.stepOrder.push(stepName);
+    }
+    if (this.stepOrder.length === 1) {
+      this.currentStep = stepName;
+    }
+    return this;
+  };
+
+  FormValidator.prototype.setCurrentStep = function (stepName) {
+    if (!this.steps[stepName]) {
+      return { success: false, reason: '步骤不存在', step: stepName };
+    }
+    var stepIndex = this.stepOrder.indexOf(stepName);
+    var canAccess = true;
+    var failReason = '';
+    for (var i = 0; i < stepIndex; i++) {
+      var prevStepName = this.stepOrder[i];
+      var prevStep = this.steps[prevStepName];
+      if (prevStep && prevStep.status !== STEP_STATUS.COMPLETED) {
+        var prevResult = this.validateStep(prevStepName);
+        if (!prevResult.valid) {
+          canAccess = false;
+          failReason = '前序步骤未完成';
+          break;
+        }
+      }
+    }
+    if (canAccess) {
+      var prevStepName = this.currentStep;
+      this.currentStep = stepName;
+      if (this.steps[stepName].status === STEP_STATUS.PENDING || this.steps[stepName].status === STEP_STATUS.LOCKED) {
+        this.steps[stepName].status = STEP_STATUS.IN_PROGRESS;
+      }
+      this._updateStepLockStatus();
+      if (this.onStepChange && typeof this.onStepChange === 'function') {
+        this.onStepChange({
+          previous: prevStepName,
+          current: stepName,
+          step: this.steps[stepName]
+        });
+      }
+      return { success: true, step: stepName };
+    }
+    return { success: false, reason: failReason, step: stepName };
+  };
+
+  FormValidator.prototype.getCurrentStep = function () {
+    if (!this.currentStep) return null;
+    return this.steps[this.currentStep] || null;
+  };
+
+  FormValidator.prototype.getStep = function (stepName) {
+    if (!stepName) {
+      stepName = this.currentStep;
+    }
+    return this.steps[stepName] || null;
+  };
+
+  FormValidator.prototype.getAllSteps = function () {
+    var result = [];
+    for (var i = 0; i < this.stepOrder.length; i++) {
+      var stepName = this.stepOrder[i];
+      result.push(this.steps[stepName]);
+    }
+    return result;
+  };
+
+  FormValidator.prototype.getStepFields = function (stepName) {
+    var step = this.steps[stepName];
+    if (!step) return [];
+    return step.fields || [];
+  };
+
+  FormValidator.prototype.validateStep = function (stepName) {
+    var step = this.steps[stepName];
+    if (!step) {
+      return { valid: true, errors: [], warnings: [], step: stepName, fieldResults: {} };
+    }
+    var stepFields = step.fields || [];
+    var allErrors = [];
+    var allWarnings = [];
+    var fieldResults = {};
+    var hasError = false;
+    var fieldsToValidate = [];
+    var vals = this.fieldValues;
+    for (var i = 0; i < stepFields.length; i++) {
+      var fn = stepFields[i];
+      if (this.fields[fn] && this._isFieldVisible(fn, vals)) {
+        fieldsToValidate.push(fn);
+      }
+    }
+    for (var j = 0; j < fieldsToValidate.length; j++) {
+      var fieldName = fieldsToValidate[j];
+      var val = this.fieldValues[fieldName];
+      var result = this.validateField(fieldName, val);
+      fieldResults[fieldName] = result;
+      if (result.errors.length > 0) {
+        hasError = true;
+        allErrors = allErrors.concat(result.errors);
+      }
+      if (result.warnings.length > 0) {
+        allWarnings = allWarnings.concat(result.warnings);
+      }
+    }
+    var duplicateErrors = this._detectDuplicatesInStep(stepFields, vals);
+    for (var k = 0; k < duplicateErrors.length; k++) {
+      var dupErr = duplicateErrors[k];
+      var dupField = dupErr.field;
+      if (this.errors[dupField]) {
+        this.errors[dupField].push(dupErr);
+      }
+      allErrors.push(dupErr);
+      if (fieldResults[dupField]) {
+        fieldResults[dupField].errors.push(dupErr);
+        fieldResults[dupField].valid = fieldResults[dupField].errors.length === 0;
+      }
+    }
+    if (duplicateErrors.length > 0) {
+      hasError = true;
+    }
+    var stepResult = {
+      valid: !hasError,
+      errors: allErrors,
+      warnings: allWarnings,
+      step: stepName,
+      fieldResults: fieldResults,
+      totalFields: fieldsToValidate.length,
+      errorCount: allErrors.length,
+      warningCount: allWarnings.length,
+      timestamp: Date.now()
+    };
+    if (!hasError && fieldsToValidate.length > 0) {
+      this.steps[stepName].status = STEP_STATUS.COMPLETED;
+    } else if (hasError) {
+      this.steps[stepName].status = STEP_STATUS.ERROR;
+    }
+    this._updateStepLockStatus();
+    return stepResult;
+  };
+
+  FormValidator.prototype._detectDuplicatesInStep = function (stepFields, values) {
+    var errors = [];
+    var duplicateCheckFields = [];
+    for (var i = 0; i < stepFields.length; i++) {
+      var fieldName = stepFields[i];
+      if (this.fields[fieldName] && this.fields[fieldName].unique && this._isFieldVisible(fieldName, values)) {
+        duplicateCheckFields.push(fieldName);
+      }
+    }
+    var valueMap = {};
+    for (var j = 0; j < duplicateCheckFields.length; j++) {
+      var fn = duplicateCheckFields[j];
+      var val = values[fn];
+      if (!this._isEmpty(val)) {
+        var valStr = String(val);
+        if (!valueMap[valStr]) {
+          valueMap[valStr] = [];
+        }
+        valueMap[valStr].push(fn);
+      }
+    }
+    for (var valKey in valueMap) {
+      if (valueMap.hasOwnProperty(valKey)) {
+        if (valueMap[valKey].length > 1) {
+          var fieldList = valueMap[valKey];
+          for (var k = 0; k < fieldList.length; k++) {
+            var fName = fieldList[k];
+            var field = this.fields[fName];
+            var dupMessage = field.message && field.message.unique
+              ? field.message.unique
+              : '该值与其他字段重复，请检查';
+            errors.push(this._createError(fName, 'unique', dupMessage, field.severity));
+          }
+        }
+      }
+    }
+    return errors;
+  };
+
+  FormValidator.prototype._updateStepLockStatus = function () {
+    var completedSteps = {};
+    for (var i = 0; i < this.stepOrder.length; i++) {
+      var stepName = this.stepOrder[i];
+      var step = this.steps[stepName];
+      if (i === 0) {
+        completedSteps[stepName] = step.status === STEP_STATUS.COMPLETED;
+      } else {
+        var prevStepName = this.stepOrder[i - 1];
+        var prevCompleted = completedSteps[prevStepName];
+        if (!prevCompleted && step.status !== STEP_STATUS.COMPLETED) {
+          step.status = STEP_STATUS.LOCKED;
+        }
+        completedSteps[stepName] = step.status === STEP_STATUS.COMPLETED;
+      }
+    }
+  };
+
+  FormValidator.prototype.nextStep = function () {
+    if (!this.currentStep) {
+      if (this.stepOrder.length > 0) {
+        return this.setCurrentStep(this.stepOrder[0]);
+      }
+      return { success: false, reason: '没有步骤' };
+    }
+    var currentIndex = this.stepOrder.indexOf(this.currentStep);
+    if (currentIndex === -1 || currentIndex >= this.stepOrder.length - 1) {
+      return { success: false, reason: '已是最后一步' };
+    }
+    var currentStepResult = this.validateStep(this.currentStep);
+    if (!currentStepResult.valid) {
+      return { success: false, reason: '当前步骤有错误', errors: currentStepResult.errors };
+    }
+    var nextStepName = this.stepOrder[currentIndex + 1];
+    return this.setCurrentStep(nextStepName);
+  };
+
+  FormValidator.prototype.prevStep = function () {
+    if (!this.currentStep) {
+      return { success: false, reason: '没有当前步骤' };
+    }
+    var currentIndex = this.stepOrder.indexOf(this.currentStep);
+    if (currentIndex <= 0) {
+      return { success: false, reason: '已是第一步' };
+    }
+    var prevStepName = this.stepOrder[currentIndex - 1];
+    return this.setCurrentStep(prevStepName);
+  };
+
+  FormValidator.prototype.goToStep = function (stepName) {
+    return this.setCurrentStep(stepName);
+  };
+
+  FormValidator.prototype._updateStepsFromSummary = function (summary) {
+    if (!summary || !summary.fieldResults) return;
+    for (var i = 0; i < this.stepOrder.length; i++) {
+      var stepName = this.stepOrder[i];
+      var step = this.steps[stepName];
+      if (!step) continue;
+      var stepFields = step.fields || [];
+      var hasError = false;
+      var hasIncomplete = false;
+      for (var j = 0; j < stepFields.length; j++) {
+        var fn = stepFields[j];
+        var fieldResult = summary.fieldResults[fn];
+        if (fieldResult) {
+          if (!fieldResult.valid) {
+            hasError = true;
+            break;
+          }
+        } else {
+          var field = this.fields[fn];
+          if (field && field.required && this._isEmpty(this.fieldValues[fn])) {
+            hasIncomplete = true;
+          }
+        }
+      }
+      if (hasError) {
+        step.status = STEP_STATUS.ERROR;
+      } else if (!hasIncomplete && stepFields.length > 0) {
+        var allValid = true;
+        for (var k = 0; k < stepFields.length; k++) {
+          var fName = stepFields[k];
+          var fResult = summary.fieldResults[fName];
+          if (!fResult || !fResult.valid) {
+            allValid = false;
+            break;
+          }
+        }
+        if (allValid) {
+          step.status = STEP_STATUS.COMPLETED;
+        }
+      }
+    }
+    this._updateStepLockStatus();
+  };
+
+  FormValidator.prototype.getValidationReport = function (options) {
+    options = options || {};
+    var topN = options.topN || 10;
+    var summary = this.validateAll();
+    var allErrors = summary.errors || [];
+    var allWarnings = summary.warnings || [];
+    var self = this;
+    var bySeverity = {
+      error: [],
+      warning: [],
+      info: []
+    };
+    for (var i = 0; i < allErrors.length; i++) {
+      var err = allErrors[i];
+      if (err.severity === SEVERITY.WARNING) {
+        bySeverity.warning.push(err);
+      } else {
+        bySeverity.error.push(err);
+      }
+    }
+    for (var w = 0; w < allWarnings.length; w++) {
+      bySeverity.warning.push(allWarnings[w]);
+    }
+    var byGroup = {};
+    for (var groupName in this.groups) {
+      if (this.groups.hasOwnProperty(groupName)) {
+        var groupErrors = [];
+        var groupWarnings = [];
+        var groupFields = this.groups[groupName];
+        var groupCompleted = 0;
+        var groupTotal = 0;
+        for (var g = 0; g < groupFields.length; g++) {
+          var gf = groupFields[g];
+          if (!this._isFieldVisible(gf, this.fieldValues)) continue;
+          groupTotal++;
+          var gErrors = this.errors[gf] || [];
+          var gWarnings = this.warnings[gf] || [];
+          groupErrors = groupErrors.concat(gErrors);
+          groupWarnings = groupWarnings.concat(gWarnings);
+          if (gErrors.length === 0) {
+            groupCompleted++;
+          }
+        }
+        byGroup[groupName] = {
+          name: groupName,
+          total: groupTotal,
+          completed: groupCompleted,
+          errorCount: groupErrors.length,
+          warningCount: groupWarnings.length,
+          errors: groupErrors,
+          warnings: groupWarnings,
+          firstError: groupErrors.length > 0 ? groupErrors[0] : null
+        };
+      }
+    }
+    var byStep = {};
+    for (var s = 0; s < this.stepOrder.length; s++) {
+      var stepName = this.stepOrder[s];
+      var step = this.steps[stepName];
+      if (!step) continue;
+      var stepErrors = [];
+      var stepWarnings = [];
+      var stepFields = step.fields || [];
+      var stepCompleted = 0;
+      var stepTotal = 0;
+      for (var sf = 0; sf < stepFields.length; sf++) {
+        var sField = stepFields[sf];
+        if (!this._isFieldVisible(sField, this.fieldValues)) continue;
+        stepTotal++;
+        var sErrors = this.errors[sField] || [];
+        var sWarnings = this.warnings[sField] || [];
+        stepErrors = stepErrors.concat(sErrors);
+        stepWarnings = stepWarnings.concat(sWarnings);
+        if (sErrors.length === 0) {
+          stepCompleted++;
+        }
+      }
+      var firstAction = stepErrors.length > 0
+        ? '请先完成"' + step.label + '"步骤中的错误项'
+        : '此步骤已完成';
+      byStep[stepName] = {
+        name: stepName,
+        label: step.label,
+        status: step.status,
+        total: stepTotal,
+        completed: stepCompleted,
+        errorCount: stepErrors.length,
+        warningCount: stepWarnings.length,
+        errors: stepErrors,
+        warnings: stepWarnings,
+        firstError: stepErrors.length > 0 ? stepErrors[0] : null,
+        firstAction: firstAction
+      };
+    }
+    var priorities = [];
+    var allIssues = bySeverity.error.concat(bySeverity.warning);
+    var priorityWeight = { error: 100, warning: 10 };
+    for (var p = 0; p < allIssues.length; p++) {
+      var issue = allIssues[p];
+      var field = this.fields[issue.field];
+      var weight = field && field.weight !== undefined ? field.weight : 1;
+      var priorityVal = (priorityWeight[issue.severity] || 1) * weight;
+      priorities.push({
+        field: issue.field,
+        label: field ? field.label : issue.field,
+        message: issue.message,
+        severity: issue.severity,
+        rule: issue.rule,
+        priority: priorityVal,
+        action: this._generateSuggestionText(issue, field),
+        group: field ? field.group : null,
+        step: field ? field.step : null
+      });
+    }
+    priorities.sort(function (a, b) {
+      return b.priority - a.priority;
+    });
+    if (priorities.length > topN) {
+      priorities = priorities.slice(0, topN);
+    }
+    var relatedFields = {};
+    for (var depField in this._dependencies) {
+      if (this._dependencies.hasOwnProperty(depField)) {
+        var deps = this._dependencies[depField];
+        var hasDepError = false;
+        for (var df = 0; df < deps.length; df++) {
+          if (this.errors[deps[df]] && this.errors[deps[df]].length > 0) {
+            hasDepError = true;
+            break;
+          }
+        }
+        if (this.errors[depField] && this.errors[depField].length > 0 && hasDepError) {
+          relatedFields[depField] = deps.slice();
+        }
+      }
+    }
+    var suggestions = this.generateSuggestions(allErrors);
+    var reportSummary = {
+      valid: summary.valid,
+      totalFields: summary.totalFields,
+      errorCount: summary.errorCount,
+      warningCount: summary.warningCount,
+      timestamp: summary.timestamp
+    };
+    var report = {
+      summary: reportSummary,
+      bySeverity: bySeverity,
+      byGroup: byGroup,
+      byStep: byStep,
+      priorities: priorities,
+      relatedFields: relatedFields,
+      suggestions: suggestions
+    };
+    return report;
+  };
+
+  FormValidator.prototype.addSchemaChangeLog = function (version, description, details) {
+    this.schemaChangeLog.push({
+      version: version,
+      description: description,
+      details: details || '',
+      timestamp: Date.now()
+    });
+    return this;
+  };
+
+  FormValidator.prototype.getSchemaChangeLog = function () {
+    return this.schemaChangeLog.slice();
+  };
+
+  FormValidator.prototype._isSchemaCompatible = function (importVersion) {
+    if (!importVersion) return false;
+    var currentParts = SCHEMA_VERSION.split('.');
+    var importParts = importVersion.split('.');
+    if (currentParts.length < 1 || importParts.length < 1) return false;
+    var currentMajor = parseInt(currentParts[0], 10);
+    var importMajor = parseInt(importParts[0], 10);
+    return currentMajor === importMajor;
   };
 
   function deepClone(obj) {
