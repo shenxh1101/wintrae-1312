@@ -28,6 +28,18 @@
 
   var SCHEMA_VERSION = '2.0.0';
 
+  var LINKAGE_STATUS = {
+    IDLE: 'idle',
+    PROCESSING: 'processing',
+    COMPLETED: 'completed',
+    CANCELLED: 'cancelled'
+  };
+
+  var SCHEMA_DRAFT_STATUS = {
+    DRAFT: 'draft',
+    PUBLISHED: 'published'
+  };
+
   var BUILTIN_RULES = {
     name: {
       type: 'name',
@@ -115,6 +127,10 @@
     }
   };
 
+  var GLOBAL_DRAFTS = {};
+  var GLOBAL_DRAFT_ID_COUNTER = 1;
+  var GLOBAL_PUBLISHED_VERSIONS = {};
+
   function FormValidator(options) {
     options = options || {};
     this.fields = {};
@@ -145,6 +161,7 @@
     this._derivedFields = [];
     this._changeTimers = {};
     this.schemaChangeLog = [];
+    this._linkageRequestId = {};
   }
 
   FormValidator.SEVERITY = SEVERITY;
@@ -152,6 +169,14 @@
   FormValidator.VALIDATE_STATUS = VALIDATE_STATUS;
   FormValidator.STEP_STATUS = STEP_STATUS;
   FormValidator.SCHEMA_VERSION = SCHEMA_VERSION;
+  FormValidator.LINKAGE_STATUS = LINKAGE_STATUS;
+  FormValidator.SCHEMA_DRAFT_STATUS = SCHEMA_DRAFT_STATUS;
+
+  FormValidator.clearGlobalStorage = function () {
+    GLOBAL_DRAFTS = {};
+    GLOBAL_DRAFT_ID_COUNTER = 1;
+    GLOBAL_PUBLISHED_VERSIONS = {};
+  };
 
   FormValidator.prototype.registerField = function (fieldName, config) {
     if (!fieldName || typeof fieldName !== 'string') {
@@ -206,6 +231,9 @@
       if (this._derivedFields.indexOf(fieldName) === -1) {
         this._derivedFields.push(fieldName);
       }
+    }
+    if (config.onDependencyChange && typeof config.onDependencyChange === 'function') {
+      ruleConfig.onDependencyChange = config.onDependencyChange;
     }
     this.fields[fieldName] = ruleConfig;
     this.errors[fieldName] = [];
@@ -589,18 +617,88 @@
       promises.push(this.validateFieldAsync(fn));
     }
     return Promise.all(promises).then(function () {
-      var finalSummary = self.validateAll(vals);
-      var hasAsyncError = false;
+      var asyncErrorsMap = {};
+      var asyncWarningsMap = {};
       for (var j = 0; j < asyncFields.length; j++) {
         var afn = asyncFields[j];
         var asyncResult = self._asyncResults[afn];
-        if (asyncResult && !asyncResult.valid) {
-          hasAsyncError = true;
+        if (asyncResult) {
+          asyncErrorsMap[afn] = asyncResult.errors || [];
+          asyncWarningsMap[afn] = asyncResult.warnings || [];
         }
       }
-      if (hasAsyncError) {
-        finalSummary.valid = false;
+      var finalSummary = self.validateAll(vals);
+      for (var k = 0; k < asyncFields.length; k++) {
+        var afn2 = asyncFields[k];
+        var aErrors = asyncErrorsMap[afn2] || [];
+        var aWarnings = asyncWarningsMap[afn2] || [];
+        if (aErrors.length > 0 || aWarnings.length > 0) {
+          if (self.errors[afn2]) {
+            for (var ae = 0; ae < aErrors.length; ae++) {
+              var errItem = aErrors[ae];
+              var isDup = false;
+              for (var se = 0; se < self.errors[afn2].length; se++) {
+                if (self.errors[afn2][se].rule === errItem.rule
+                  && self.errors[afn2][se].message === errItem.message) {
+                  isDup = true;
+                  break;
+                }
+              }
+              if (!isDup) {
+                self.errors[afn2].push(errItem);
+              }
+            }
+          }
+          if (finalSummary.fieldResults[afn2]) {
+            for (var fe = 0; fe < aErrors.length; fe++) {
+              var fErrItem = aErrors[fe];
+              var fIsDup = false;
+              for (var fse = 0; fse < finalSummary.fieldResults[afn2].errors.length; fse++) {
+                if (finalSummary.fieldResults[afn2].errors[fse].rule === fErrItem.rule
+                  && finalSummary.fieldResults[afn2].errors[fse].message === fErrItem.message) {
+                  fIsDup = true;
+                  break;
+                }
+              }
+              if (!fIsDup) {
+                finalSummary.fieldResults[afn2].errors.push(fErrItem);
+                finalSummary.errors.push(fErrItem);
+              }
+            }
+            for (var fw = 0; fw < aWarnings.length; fw++) {
+              var fWarnItem = aWarnings[fw];
+              var fWarnDup = false;
+              for (var fsw = 0; fsw < finalSummary.fieldResults[afn2].warnings.length; fsw++) {
+                if (finalSummary.fieldResults[afn2].warnings[fsw].rule === fWarnItem.rule
+                  && finalSummary.fieldResults[afn2].warnings[fsw].message === fWarnItem.message) {
+                  fWarnDup = true;
+                  break;
+                }
+              }
+              if (!fWarnDup) {
+                finalSummary.fieldResults[afn2].warnings.push(fWarnItem);
+                finalSummary.warnings.push(fWarnItem);
+              }
+            }
+            finalSummary.fieldResults[afn2].valid = finalSummary.fieldResults[afn2].errors.length === 0;
+          }
+        }
       }
+      var totalErrorCount = 0;
+      var hasAnyError = false;
+      for (var frKey in finalSummary.fieldResults) {
+        if (finalSummary.fieldResults.hasOwnProperty(frKey)) {
+          var fr = finalSummary.fieldResults[frKey];
+          totalErrorCount += fr.errors.length;
+          if (!fr.valid) {
+            hasAnyError = true;
+          }
+        }
+      }
+      finalSummary.errorCount = totalErrorCount;
+      finalSummary.valid = !hasAnyError;
+      finalSummary.firstError = finalSummary.errors.length > 0 ? finalSummary.errors[0] : null;
+      self._updateStepsFromSummary(finalSummary);
       return finalSummary;
     });
   };
@@ -1079,6 +1177,7 @@
     this._derivedFields = [];
     this._changeTimers = {};
     this.schemaChangeLog = [];
+    this._linkageRequestId = {};
     return this;
   };
 
@@ -1572,31 +1671,141 @@
   };
 
   FormValidator.prototype._processDependencies = function (fieldName, value) {
+    var self = this;
     var dependents = this._dependencies[fieldName];
     if (!dependents || dependents.length === 0) {
       return;
     }
+    if (!this._linkageRequestId[fieldName]) {
+      this._linkageRequestId[fieldName] = 0;
+    }
+    this._linkageRequestId[fieldName]++;
+    var requestId = this._linkageRequestId[fieldName];
     for (var i = 0; i < dependents.length; i++) {
       var depField = dependents[i];
       var depFieldConfig = this.fields[depField];
       if (!depFieldConfig) continue;
+      if (requestId !== this._linkageRequestId[fieldName]) {
+        return;
+      }
+      if (depFieldConfig.deriveOptions && typeof depFieldConfig.deriveOptions === 'function') {
+        try {
+          var newOptions = depFieldConfig.deriveOptions(this.fieldValues, fieldName, value, depFieldConfig);
+          if (Array.isArray(newOptions)) {
+            depFieldConfig.options = newOptions;
+            if (this.fieldMetas[depField]) {
+              this.fieldMetas[depField].options = newOptions;
+            }
+            var currentVal = this.fieldValues[depField];
+            var oldValueInOptions = false;
+            if (Array.isArray(currentVal)) {
+              oldValueInOptions = true;
+              for (var oi = 0; oi < currentVal.length; oi++) {
+                if (newOptions.indexOf(currentVal[oi]) === -1) {
+                  oldValueInOptions = false;
+                  break;
+                }
+              }
+            } else {
+              oldValueInOptions = newOptions.indexOf(currentVal) !== -1;
+            }
+            if (!oldValueInOptions || this._isEmpty(currentVal)) {
+              if (depFieldConfig.deriveDefaultValue && typeof depFieldConfig.deriveDefaultValue === 'function') {
+                var newDefault = depFieldConfig.deriveDefaultValue(this.fieldValues, fieldName, value, depFieldConfig);
+                this.fieldValues[depField] = newDefault;
+                if (this.fieldMetas[depField]) {
+                  this.fieldMetas[depField].initialValue = newDefault;
+                }
+              } else {
+                this.fieldValues[depField] = undefined;
+              }
+            }
+          }
+        } catch (e) {}
+      } else if (depFieldConfig.deriveDefaultValue && typeof depFieldConfig.deriveDefaultValue === 'function') {
+        try {
+          var currentVal2 = this.fieldValues[depField];
+          if (this._isEmpty(currentVal2)) {
+            var newDefault2 = depFieldConfig.deriveDefaultValue(this.fieldValues, fieldName, value, depFieldConfig);
+            this.fieldValues[depField] = newDefault2;
+            if (this.fieldMetas[depField]) {
+              this.fieldMetas[depField].initialValue = newDefault2;
+            }
+          }
+        } catch (e) {}
+      }
+      if (requestId !== this._linkageRequestId[fieldName]) {
+        return;
+      }
+      if (depFieldConfig.deriveRequired && typeof depFieldConfig.deriveRequired === 'function') {
+        try {
+          var newRequired = depFieldConfig.deriveRequired(this.fieldValues, fieldName, value, depFieldConfig);
+          depFieldConfig.required = !!newRequired;
+        } catch (e) {}
+      }
+      if (requestId !== this._linkageRequestId[fieldName]) {
+        return;
+      }
+      if (depFieldConfig.deriveDisabled && typeof depFieldConfig.deriveDisabled === 'function') {
+        try {
+          var newDisabled = depFieldConfig.deriveDisabled(this.fieldValues, fieldName, value, depFieldConfig);
+          depFieldConfig.disabled = !!newDisabled;
+          if (this.fieldMetas[depField]) {
+            this.fieldMetas[depField].disabled = !!newDisabled;
+          }
+        } catch (e) {}
+      }
+      if (requestId !== this._linkageRequestId[fieldName]) {
+        return;
+      }
+      if (depFieldConfig.deriveMessage && typeof depFieldConfig.deriveMessage === 'function') {
+        try {
+          var newMessages = depFieldConfig.deriveMessage(this.fieldValues, fieldName, value, depFieldConfig);
+          if (newMessages && typeof newMessages === 'object') {
+            if (!depFieldConfig.message) {
+              depFieldConfig.message = {};
+            }
+            for (var msgKey in newMessages) {
+              if (newMessages.hasOwnProperty(msgKey)) {
+                depFieldConfig.message[msgKey] = newMessages[msgKey];
+              }
+            }
+          }
+        } catch (e) {}
+      }
+      if (requestId !== this._linkageRequestId[fieldName]) {
+        return;
+      }
       if (depFieldConfig.deriveValue && typeof depFieldConfig.deriveValue === 'function') {
         try {
           var derivedValue = depFieldConfig.deriveValue(this.fieldValues, this.fields);
           var oldDerivedValue = this.fieldValues[depField];
           if (derivedValue !== oldDerivedValue) {
             this.fieldValues[depField] = derivedValue;
-            if (this.onDependencyChange && typeof this.onDependencyChange === 'function') {
-              this.onDependencyChange({
-                field: depField,
-                value: derivedValue,
-                sourceField: fieldName,
-                sourceValue: value
-              });
-            }
           }
         } catch (e) {}
       }
+      if (depFieldConfig.onDependencyChange && typeof depFieldConfig.onDependencyChange === 'function') {
+        try {
+          depFieldConfig.onDependencyChange({
+            field: depField,
+            value: this.fieldValues[depField],
+            sourceField: fieldName,
+            sourceValue: value
+          });
+        } catch (e) {}
+      }
+      if (this.onDependencyChange && typeof this.onDependencyChange === 'function') {
+        try {
+          this.onDependencyChange({
+            field: depField,
+            value: this.fieldValues[depField],
+            sourceField: fieldName,
+            sourceValue: value
+          });
+        } catch (e) {}
+      }
+      this.clearFieldStatus(depField);
     }
   };
 
@@ -2037,6 +2246,25 @@
       var field = this.fields[issue.field];
       var weight = field && field.weight !== undefined ? field.weight : 1;
       var priorityVal = (priorityWeight[issue.severity] || 1) * weight;
+      var affectedBy = field && field.dependsOn ? field.dependsOn.slice() : [];
+      var affects = this._dependencies[issue.field] ? this._dependencies[issue.field].slice() : [];
+      var relatedErrorFields = [];
+      for (var rei = 0; rei < affectedBy.length; rei++) {
+        var rfn = affectedBy[rei];
+        if (this.errors[rfn] && this.errors[rfn].length > 0) {
+          if (relatedErrorFields.indexOf(rfn) === -1) {
+            relatedErrorFields.push(rfn);
+          }
+        }
+      }
+      for (var rei2 = 0; rei2 < affects.length; rei2++) {
+        var rfn2 = affects[rei2];
+        if (this.errors[rfn2] && this.errors[rfn2].length > 0) {
+          if (relatedErrorFields.indexOf(rfn2) === -1) {
+            relatedErrorFields.push(rfn2);
+          }
+        }
+      }
       priorities.push({
         field: issue.field,
         label: field ? field.label : issue.field,
@@ -2046,7 +2274,10 @@
         priority: priorityVal,
         action: this._generateSuggestionText(issue, field),
         group: field ? field.group : null,
-        step: field ? field.step : null
+        step: field ? field.step : null,
+        affectedBy: affectedBy,
+        affects: affects,
+        relatedErrorFields: relatedErrorFields
       });
     }
     priorities.sort(function (a, b) {
@@ -2059,16 +2290,66 @@
     for (var depField in this._dependencies) {
       if (this._dependencies.hasOwnProperty(depField)) {
         var deps = this._dependencies[depField];
-        var hasDepError = false;
+        var affectsWithError = [];
         for (var df = 0; df < deps.length; df++) {
-          if (this.errors[deps[df]] && this.errors[deps[df]].length > 0) {
-            hasDepError = true;
-            break;
+          var depFn = deps[df];
+          if (this.errors[depFn] && this.errors[depFn].length > 0) {
+            var depF = this.fields[depFn];
+            affectsWithError.push({
+              field: depFn,
+              label: depF ? depF.label : depFn,
+              errors: this.errors[depFn] || [],
+              severity: (this.errors[depFn] && this.errors[depFn].length > 0)
+                ? (this.errors[depFn][0].severity || SEVERITY.ERROR)
+                : SEVERITY.ERROR
+            });
           }
         }
-        if (this.errors[depField] && this.errors[depField].length > 0 && hasDepError) {
-          relatedFields[depField] = deps.slice();
+        var sourceField = this.fields[depField];
+        var sourceHasError = this.errors[depField] && this.errors[depField].length > 0;
+        if (sourceHasError || affectsWithError.length > 0) {
+          relatedFields[depField] = {
+            hasError: sourceHasError,
+            label: sourceField ? sourceField.label : depField,
+            affects: affectsWithError
+          };
         }
+      }
+    }
+    var fieldRelations = {};
+    for (var frField in this.fields) {
+      if (this.fields.hasOwnProperty(frField)) {
+        var frConfig = this.fields[frField];
+        var frAffectedBy = [];
+        var frAffects = [];
+        var frHasError = this.errors[frField] && this.errors[frField].length > 0;
+        if (frConfig.dependsOn && frConfig.dependsOn.length > 0) {
+          for (var ab = 0; ab < frConfig.dependsOn.length; ab++) {
+            var abFn = frConfig.dependsOn[ab];
+            var abField = this.fields[abFn];
+            frAffectedBy.push({
+              field: abFn,
+              label: abField ? abField.label : abFn,
+              hasError: this.errors[abFn] && this.errors[abFn].length > 0
+            });
+          }
+        }
+        if (this._dependencies[frField] && this._dependencies[frField].length > 0) {
+          for (var af = 0; af < this._dependencies[frField].length; af++) {
+            var afFn = this._dependencies[frField][af];
+            var afField = this.fields[afFn];
+            frAffects.push({
+              field: afFn,
+              label: afField ? afField.label : afFn,
+              hasError: this.errors[afFn] && this.errors[afFn].length > 0
+            });
+          }
+        }
+        fieldRelations[frField] = {
+          affectedBy: frAffectedBy,
+          affects: frAffects,
+          hasError: frHasError
+        };
       }
     }
     var suggestions = this.generateSuggestions(allErrors);
@@ -2086,6 +2367,7 @@
       byStep: byStep,
       priorities: priorities,
       relatedFields: relatedFields,
+      fieldRelations: fieldRelations,
       suggestions: suggestions
     };
     return report;
@@ -2109,10 +2391,279 @@
     if (!importVersion) return false;
     var currentParts = SCHEMA_VERSION.split('.');
     var importParts = importVersion.split('.');
-    if (currentParts.length < 1 || importParts.length < 1) return false;
+    if (currentParts[0] !== importParts[0]) {
+      return false;
+    }
     var currentMajor = parseInt(currentParts[0], 10);
     var importMajor = parseInt(importParts[0], 10);
     return currentMajor === importMajor;
+  };
+
+  FormValidator.prototype._buildFullSnapshot = function () {
+    var self = this;
+    var snapshot = {
+      __fullSnapshot: true,
+      schemaVersion: SCHEMA_VERSION,
+      locale: this.locale,
+      defaultDebounce: this.defaultDebounce,
+      groups: deepClone(this.groups),
+      steps: {},
+      stepOrder: this.stepOrder.slice(),
+      fields: {},
+      dependencies: deepClone(this._dependencies),
+      derivedFields: this._derivedFields.slice()
+    };
+    for (var i = 0; i < this.stepOrder.length; i++) {
+      var stepName = this.stepOrder[i];
+      snapshot.steps[stepName] = deepClone(this.steps[stepName]);
+    }
+    for (var fieldName in this.fields) {
+      if (this.fields.hasOwnProperty(fieldName)) {
+        snapshot.fields[fieldName] = self._cloneFieldConfig(this.fields[fieldName]);
+      }
+    }
+    return snapshot;
+  };
+
+  FormValidator.prototype._cloneFieldConfig = function (fieldConfig) {
+    var cloned = {};
+    for (var key in fieldConfig) {
+      if (fieldConfig.hasOwnProperty(key)) {
+        var val = fieldConfig[key];
+        if (val === null || val === undefined) {
+          cloned[key] = val;
+        } else if (val instanceof RegExp) {
+          cloned[key] = new RegExp(val.source, val.flags);
+        } else if (val instanceof Date) {
+          cloned[key] = new Date(val.getTime());
+        } else if (Array.isArray(val)) {
+          cloned[key] = val.map(function (item) {
+            if (typeof item === 'object' && item !== null) {
+              return deepClone(item);
+            }
+            return item;
+          });
+        } else if (typeof val === 'object') {
+          cloned[key] = deepClone(val);
+        } else {
+          cloned[key] = val;
+        }
+      }
+    }
+    return cloned;
+  };
+
+  FormValidator.prototype._restoreFromSnapshot = function (snapshot, options) {
+    options = options || {};
+    if (options.reset !== false) {
+      this.reset();
+    }
+    if (snapshot.locale) this.locale = snapshot.locale;
+    if (snapshot.defaultDebounce !== undefined) this.defaultDebounce = snapshot.defaultDebounce;
+    if (snapshot.groups && typeof snapshot.groups === 'object') {
+      for (var g in snapshot.groups) {
+        if (snapshot.groups.hasOwnProperty(g)) {
+          this.groups[g] = snapshot.groups[g].slice ? snapshot.groups[g].slice() : [];
+        }
+      }
+    }
+    if (snapshot.stepOrder && Array.isArray(snapshot.stepOrder)) {
+      this.stepOrder = snapshot.stepOrder.slice();
+    }
+    if (snapshot.steps && typeof snapshot.steps === 'object') {
+      for (var sName in snapshot.steps) {
+        if (snapshot.steps.hasOwnProperty(sName)) {
+          this.steps[sName] = deepClone(snapshot.steps[sName]);
+        }
+      }
+    }
+    if (snapshot.fields && typeof snapshot.fields === 'object') {
+      for (var fName in snapshot.fields) {
+        if (snapshot.fields.hasOwnProperty(fName)) {
+          var fieldCfg = this._cloneFieldConfig(snapshot.fields[fName]);
+          this.registerField(fName, fieldCfg);
+        }
+      }
+    }
+    if (snapshot.dependencies && typeof snapshot.dependencies === 'object') {
+      for (var d in snapshot.dependencies) {
+        if (snapshot.dependencies.hasOwnProperty(d)) {
+          this._dependencies[d] = snapshot.dependencies[d].slice ? snapshot.dependencies[d].slice() : [];
+        }
+      }
+    }
+    if (snapshot.derivedFields && Array.isArray(snapshot.derivedFields)) {
+      this._derivedFields = snapshot.derivedFields.slice();
+    }
+    return this;
+  };
+
+  FormValidator.prototype.saveDraft = function (options) {
+    options = options || {};
+    var id = GLOBAL_DRAFT_ID_COUNTER++;
+    var now = new Date().toISOString();
+    var draft = {
+      id: id,
+      name: options.name || ('草稿 ' + id),
+      description: options.description || '',
+      schema: this._buildFullSnapshot(),
+      createdAt: now,
+      updatedAt: now
+    };
+    GLOBAL_DRAFTS[id] = draft;
+    return {
+      id: draft.id,
+      name: draft.name,
+      description: draft.description,
+      createdAt: draft.createdAt
+    };
+  };
+
+  FormValidator.prototype.getDrafts = function () {
+    var drafts = [];
+    for (var key in GLOBAL_DRAFTS) {
+      if (GLOBAL_DRAFTS.hasOwnProperty(key)) {
+        drafts.push(GLOBAL_DRAFTS[key]);
+      }
+    }
+    drafts.sort(function (a, b) {
+      if (b.id !== a.id) return b.id - a.id;
+      return new Date(b.updatedAt) - new Date(a.updatedAt);
+    });
+    for (var di = 0; di < drafts.length; di++) {
+      drafts[di] = deepClone(drafts[di]);
+    }
+    return drafts;
+  };
+
+  FormValidator.prototype.getDraft = function (draftId) {
+    var draft = GLOBAL_DRAFTS[draftId];
+    if (!draft) return null;
+    return deepClone(draft);
+  };
+
+  FormValidator.prototype.deleteDraft = function (draftId) {
+    if (GLOBAL_DRAFTS[draftId]) {
+      delete GLOBAL_DRAFTS[draftId];
+      return true;
+    }
+    return false;
+  };
+
+  FormValidator.prototype.previewDraft = function (draftId, values) {
+    var draft = GLOBAL_DRAFTS[draftId];
+    if (!draft) {
+      throw new Error('草稿不存在: ' + draftId);
+    }
+    var tempValidator = new FormValidator();
+    if (draft.schema && draft.schema.__fullSnapshot) {
+      tempValidator._restoreFromSnapshot(draft.schema);
+    } else {
+      tempValidator.importSchema(deepClone(draft.schema));
+    }
+    var syncResult = tempValidator.validateAll(values || {});
+    var asyncFields = [];
+    var vals = values || {};
+    for (var fn in tempValidator.fields) {
+      if (tempValidator.fields.hasOwnProperty(fn)) {
+        var f = tempValidator.fields[fn];
+        if (f.asyncValidator && typeof f.asyncValidator === 'function'
+          && tempValidator._isFieldVisible(fn, vals)) {
+          asyncFields.push(fn);
+        }
+      }
+    }
+    var asyncPromise = null;
+    if (asyncFields.length > 0) {
+      asyncPromise = tempValidator.validateAllAsync(values || {});
+    }
+    return {
+      syncResult: syncResult,
+      asyncPromise: asyncPromise
+    };
+  };
+
+  FormValidator.prototype.publishDraft = function (draftId, options) {
+    options = options || {};
+    var draft = GLOBAL_DRAFTS[draftId];
+    if (!draft) {
+      throw new Error('草稿不存在: ' + draftId);
+    }
+    var version = options.version;
+    if (!version) {
+      throw new Error('版本号不能为空');
+    }
+    var versionPattern = /^\d+\.\d+\.\d+$/;
+    if (!versionPattern.test(version)) {
+      throw new Error('版本号格式不正确，应为 x.y.z 格式');
+    }
+    if (GLOBAL_PUBLISHED_VERSIONS[version] && !options.force) {
+      throw new Error('版本 ' + version + ' 已存在，使用 force: true 覆盖');
+    }
+    var now = new Date().toISOString();
+    var published = {
+      version: version,
+      description: options.description || '',
+      schema: draft.schema,
+      draftId: draftId,
+      publishedAt: now,
+      _publishedOrder: Object.keys(GLOBAL_PUBLISHED_VERSIONS).length
+    };
+    GLOBAL_PUBLISHED_VERSIONS[version] = published;
+    return deepClone(published);
+  };
+
+  FormValidator.prototype.getPublishedVersions = function () {
+    var versions = [];
+    for (var key in GLOBAL_PUBLISHED_VERSIONS) {
+      if (GLOBAL_PUBLISHED_VERSIONS.hasOwnProperty(key)) {
+        versions.push(GLOBAL_PUBLISHED_VERSIONS[key]);
+      }
+    }
+    versions.sort(function (a, b) {
+      if (b._publishedOrder !== a._publishedOrder) {
+        return b._publishedOrder - a._publishedOrder;
+      }
+      return new Date(b.publishedAt) - new Date(a.publishedAt);
+    });
+    for (var vi = 0; vi < versions.length; vi++) {
+      versions[vi] = deepClone(versions[vi]);
+    }
+    return versions;
+  };
+
+  FormValidator.prototype.getPublishedVersion = function (version) {
+    var published = GLOBAL_PUBLISHED_VERSIONS[version];
+    if (!published) return null;
+    return deepClone(published);
+  };
+
+  FormValidator.prototype.loadPublishedVersion = function (version, options) {
+    options = options || {};
+    var published = GLOBAL_PUBLISHED_VERSIONS[version];
+    if (!published) {
+      throw new Error('已发布版本不存在: ' + version);
+    }
+    if (published.schema && published.schema.__fullSnapshot) {
+      var restoreOptions = {
+        reset: options.reset !== false
+      };
+      this._restoreFromSnapshot(published.schema, restoreOptions);
+    } else {
+      var importOptions = {
+        reset: options.reset !== false
+      };
+      this.importSchema(deepClone(published.schema), importOptions);
+    }
+    return this;
+  };
+
+  FormValidator.prototype.deletePublishedVersion = function (version) {
+    if (GLOBAL_PUBLISHED_VERSIONS[version]) {
+      delete GLOBAL_PUBLISHED_VERSIONS[version];
+      return true;
+    }
+    return false;
   };
 
   function deepClone(obj) {
