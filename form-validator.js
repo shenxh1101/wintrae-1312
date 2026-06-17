@@ -130,6 +130,18 @@
   var GLOBAL_DRAFTS = {};
   var GLOBAL_DRAFT_ID_COUNTER = 1;
   var GLOBAL_PUBLISHED_VERSIONS = {};
+  var GLOBAL_ROLLBACK_HISTORY = [];
+  var GLOBAL_ROLLBACK_ID_COUNTER = 1;
+  var GLOBAL_MONITORING_STATS = {
+    totalSubmissions: 0,
+    totalErrors: 0,
+    fieldErrors: {},
+    fieldAsyncFailures: {},
+    groupErrors: {},
+    stepErrors: {},
+    ruleCounts: {},
+    lastUpdatedAt: null
+  };
 
   function FormValidator(options) {
     options = options || {};
@@ -176,6 +188,18 @@
     GLOBAL_DRAFTS = {};
     GLOBAL_DRAFT_ID_COUNTER = 1;
     GLOBAL_PUBLISHED_VERSIONS = {};
+    GLOBAL_ROLLBACK_HISTORY = [];
+    GLOBAL_ROLLBACK_ID_COUNTER = 1;
+    GLOBAL_MONITORING_STATS = {
+      totalSubmissions: 0,
+      totalErrors: 0,
+      fieldErrors: {},
+      fieldAsyncFailures: {},
+      groupErrors: {},
+      stepErrors: {},
+      ruleCounts: {},
+      lastUpdatedAt: null
+    };
   };
 
   FormValidator.prototype.registerField = function (fieldName, config) {
@@ -524,7 +548,8 @@
     };
   };
 
-  FormValidator.prototype.validateAll = function (values) {
+  FormValidator.prototype.validateAll = function (values, _options) {
+    _options = _options || {};
     var allErrors = [];
     var allWarnings = [];
     var fieldResults = {};
@@ -589,17 +614,17 @@
       this.onFormValidate(summary);
     }
     this._updateStepsFromSummary(summary);
+    if (_options.skipMonitoring !== true) {
+      this._recordMonitoringStats(summary, vals);
+    }
     return summary;
   };
 
   FormValidator.prototype.validateAllAsync = function (values) {
     var self = this;
-    var syncSummary = this.validateAll(values);
-    if (syncSummary.valid === false) {
-      return Promise.resolve(syncSummary);
-    }
-    var asyncFields = [];
     var vals = values || this.fieldValues;
+    var syncSummary = this.validateAll(vals, { skipMonitoring: true });
+    var asyncFields = [];
     for (var fieldName in this.fields) {
       if (this.fields.hasOwnProperty(fieldName)) {
         var field = this.fields[fieldName];
@@ -609,6 +634,7 @@
       }
     }
     if (asyncFields.length === 0) {
+      this._recordMonitoringStats(syncSummary, vals);
       return Promise.resolve(syncSummary);
     }
     var promises = [];
@@ -627,7 +653,7 @@
           asyncWarningsMap[afn] = asyncResult.warnings || [];
         }
       }
-      var finalSummary = self.validateAll(vals);
+      var finalSummary = self.validateAll(vals, { skipMonitoring: true });
       for (var k = 0; k < asyncFields.length; k++) {
         var afn2 = asyncFields[k];
         var aErrors = asyncErrorsMap[afn2] || [];
@@ -699,6 +725,7 @@
       finalSummary.valid = !hasAnyError;
       finalSummary.firstError = finalSummary.errors.length > 0 ? finalSummary.errors[0] : null;
       self._updateStepsFromSummary(finalSummary);
+      self._recordMonitoringStats(finalSummary, vals);
       return finalSummary;
     });
   };
@@ -2410,6 +2437,7 @@
       steps: {},
       stepOrder: this.stepOrder.slice(),
       fields: {},
+      customRules: {},
       dependencies: deepClone(this._dependencies),
       derivedFields: this._derivedFields.slice()
     };
@@ -2420,6 +2448,11 @@
     for (var fieldName in this.fields) {
       if (this.fields.hasOwnProperty(fieldName)) {
         snapshot.fields[fieldName] = self._cloneFieldConfig(this.fields[fieldName]);
+      }
+    }
+    for (var ruleName in this.customRules) {
+      if (this.customRules.hasOwnProperty(ruleName)) {
+        snapshot.customRules[ruleName] = this._cloneFieldConfig(this.customRules[ruleName]);
       }
     }
     return snapshot;
@@ -2482,6 +2515,19 @@
         if (snapshot.fields.hasOwnProperty(fName)) {
           var fieldCfg = this._cloneFieldConfig(snapshot.fields[fName]);
           this.registerField(fName, fieldCfg);
+        }
+      }
+    }
+    if (snapshot.customRules && typeof snapshot.customRules === 'object') {
+      for (var rName in snapshot.customRules) {
+        if (snapshot.customRules.hasOwnProperty(rName)) {
+          var ruleCfg = this._cloneFieldConfig(snapshot.customRules[rName]);
+          if (ruleCfg && typeof ruleCfg.validator === 'function') {
+            this.customRules[rName] = {
+              validator: ruleCfg.validator,
+              message: ruleCfg.message || '校验不通过'
+            };
+          }
         }
       }
     }
@@ -2664,6 +2710,350 @@
       return true;
     }
     return false;
+  };
+
+  FormValidator.prototype.diffVersions = function (fromVersion, toVersion) {
+    var from = fromVersion === 'current' ? this._buildFullSnapshot() : null;
+    var to = toVersion === 'current' ? this._buildFullSnapshot() : null;
+    if (from === null) {
+      var fromPub = GLOBAL_PUBLISHED_VERSIONS[fromVersion];
+      if (!fromPub) {
+        throw new Error('源版本不存在: ' + fromVersion);
+      }
+      from = fromPub.schema;
+    }
+    if (to === null) {
+      var toPub = GLOBAL_PUBLISHED_VERSIONS[toVersion];
+      if (!toPub) {
+        throw new Error('目标版本不存在: ' + toVersion);
+      }
+      to = toPub.schema;
+    }
+    var diff = {
+      from: fromVersion,
+      to: toVersion,
+      fieldChanges: {},
+      addedFields: [],
+      removedFields: [],
+      messageChanges: {},
+      linkageChanges: {},
+      customRuleChanges: {},
+      addedCustomRules: [],
+      removedCustomRules: [],
+      summary: {
+        addedFields: 0,
+        removedFields: 0,
+        changedFields: 0,
+        addedCustomRules: 0,
+        removedCustomRules: 0,
+        changedCustomRules: 0
+      }
+    };
+    var fromFields = from.fields || {};
+    var toFields = to.fields || {};
+    var allFields = {};
+    for (var fk in fromFields) { if (fromFields.hasOwnProperty(fk)) allFields[fk] = true; }
+    for (var fk2 in toFields) { if (toFields.hasOwnProperty(fk2)) allFields[fk2] = true; }
+    for (var fieldName in allFields) {
+      if (allFields.hasOwnProperty(fieldName)) {
+        var inFrom = fromFields[fieldName] !== undefined;
+        var inTo = toFields[fieldName] !== undefined;
+        if (inFrom && !inTo) {
+          diff.removedFields.push(fieldName);
+          diff.summary.removedFields++;
+        } else if (!inFrom && inTo) {
+          diff.addedFields.push(fieldName);
+          diff.summary.addedFields++;
+          var toCfg = toFields[fieldName];
+          if (toCfg && toCfg.message) {
+            diff.messageChanges[fieldName] = { old: undefined, new: toCfg.message };
+          }
+          var toHasLinkage = !!(toCfg && (toCfg.dependsOn || toCfg.deriveOptions
+            || toCfg.deriveDefaultValue || toCfg.deriveRequired || toCfg.deriveDisabled
+            || toCfg.deriveMessage || toCfg.deriveValue));
+          if (toHasLinkage) {
+            diff.linkageChanges[fieldName] = {
+              oldDependsOn: undefined,
+              newDependsOn: toCfg.dependsOn,
+              hasDeriveOptions: !!toCfg.deriveOptions,
+              hasDeriveDefaultValue: !!toCfg.deriveDefaultValue,
+              hasDeriveRequired: !!toCfg.deriveRequired,
+              hasDeriveDisabled: !!toCfg.deriveDisabled,
+              hasDeriveMessage: !!toCfg.deriveMessage,
+              hasDeriveValue: !!toCfg.deriveValue
+            };
+          }
+        } else {
+          var fCfg = fromFields[fieldName];
+          var tCfg = toFields[fieldName];
+          var change = {
+            field: fieldName,
+            labelChanged: fCfg.label !== tCfg.label,
+            oldLabel: fCfg.label,
+            newLabel: tCfg.label,
+            typeChanged: fCfg.type !== tCfg.type,
+            oldType: fCfg.type,
+            newType: tCfg.type,
+            requiredChanged: fCfg.required !== tCfg.required,
+            oldRequired: fCfg.required,
+            newRequired: tCfg.required,
+            messageChanged: JSON.stringify(fCfg.message) !== JSON.stringify(tCfg.message),
+            oldMessage: fCfg.message,
+            newMessage: tCfg.message,
+            optionsChanged: JSON.stringify(fCfg.options) !== JSON.stringify(tCfg.options),
+            oldOptions: fCfg.options,
+            newOptions: tCfg.options,
+            dependsOnChanged: JSON.stringify(fCfg.dependsOn) !== JSON.stringify(tCfg.dependsOn),
+            oldDependsOn: fCfg.dependsOn,
+            newDependsOn: tCfg.dependsOn,
+            hasDeriveFunctions: !!(tCfg.deriveOptions || tCfg.deriveDefaultValue || tCfg.deriveRequired
+              || tCfg.deriveDisabled || tCfg.deriveMessage || tCfg.deriveValue),
+            details: {}
+          };
+          var hasAnyChange = change.labelChanged || change.typeChanged || change.requiredChanged
+            || change.messageChanged || change.optionsChanged || change.dependsOnChanged;
+          if (hasAnyChange) {
+            diff.fieldChanges[fieldName] = change;
+            diff.summary.changedFields++;
+            if (change.messageChanged) {
+              diff.messageChanges[fieldName] = { old: fCfg.message, new: tCfg.message };
+            }
+            if (change.dependsOnChanged || change.hasDeriveFunctions) {
+              diff.linkageChanges[fieldName] = {
+                oldDependsOn: fCfg.dependsOn,
+                newDependsOn: tCfg.dependsOn,
+                hasDeriveOptions: !!tCfg.deriveOptions,
+                hasDeriveDefaultValue: !!tCfg.deriveDefaultValue,
+                hasDeriveRequired: !!tCfg.deriveRequired,
+                hasDeriveDisabled: !!tCfg.deriveDisabled,
+                hasDeriveMessage: !!tCfg.deriveMessage,
+                hasDeriveValue: !!tCfg.deriveValue
+              };
+            }
+          }
+        }
+      }
+    }
+    var fromRules = from.customRules || {};
+    var toRules = to.customRules || {};
+    var allRules = {};
+    for (var rk in fromRules) { if (fromRules.hasOwnProperty(rk)) allRules[rk] = true; }
+    for (var rk2 in toRules) { if (toRules.hasOwnProperty(rk2)) allRules[rk2] = true; }
+    for (var ruleName in allRules) {
+      if (allRules.hasOwnProperty(ruleName)) {
+        var rInFrom = fromRules[ruleName] !== undefined;
+        var rInTo = toRules[ruleName] !== undefined;
+        if (rInFrom && !rInTo) {
+          diff.removedCustomRules.push(ruleName);
+          diff.summary.removedCustomRules++;
+        } else if (!rInFrom && rInTo) {
+          diff.addedCustomRules.push(ruleName);
+          diff.summary.addedCustomRules++;
+        } else {
+          var fr = fromRules[ruleName];
+          var tr = toRules[ruleName];
+          if (fr.message !== tr.message) {
+            diff.customRuleChanges[ruleName] = {
+              messageChanged: true,
+              oldMessage: fr.message,
+              newMessage: tr.message
+            };
+            diff.summary.changedCustomRules++;
+          }
+        }
+      }
+    }
+    return diff;
+  };
+
+  FormValidator.prototype.rollbackToVersion = function (version, options) {
+    options = options || {};
+    var published = GLOBAL_PUBLISHED_VERSIONS[version];
+    if (!published) {
+      throw new Error('已发布版本不存在: ' + version);
+    }
+    var prevSnapshot = this._buildFullSnapshot();
+    this.loadPublishedVersion(version, { reset: options.reset !== false });
+    var historyId = GLOBAL_ROLLBACK_ID_COUNTER++;
+    var rollbackRecord = {
+      id: historyId,
+      fromVersion: options.fromVersion || 'current',
+      toVersion: version,
+      description: options.description || '',
+      previousSnapshot: prevSnapshot,
+      rolledBackAt: new Date().toISOString()
+    };
+    GLOBAL_ROLLBACK_HISTORY.push(rollbackRecord);
+    return {
+      id: rollbackRecord.id,
+      fromVersion: rollbackRecord.fromVersion,
+      toVersion: rollbackRecord.toVersion,
+      rolledBackAt: rollbackRecord.rolledBackAt
+    };
+  };
+
+  FormValidator.prototype.getRollbackHistory = function () {
+    return GLOBAL_ROLLBACK_HISTORY.slice().reverse();
+  };
+
+  FormValidator.prototype._recordMonitoringStats = function (summary, values) {
+    var self = this;
+    var stats = GLOBAL_MONITORING_STATS;
+    stats.totalSubmissions++;
+    stats.totalErrors += summary.errorCount || 0;
+    stats.lastUpdatedAt = new Date().toISOString();
+    if (summary.fieldResults) {
+      for (var fn in summary.fieldResults) {
+        if (summary.fieldResults.hasOwnProperty(fn)) {
+          var fr = summary.fieldResults[fn];
+          if (!stats.fieldErrors[fn]) {
+            stats.fieldErrors[fn] = { label: (this.fields[fn] && this.fields[fn].label) || fn, total: 0, byRule: {} };
+          }
+          if (fr.errors && fr.errors.length > 0) {
+            stats.fieldErrors[fn].total += fr.errors.length;
+            for (var ei = 0; ei < fr.errors.length; ei++) {
+              var err = fr.errors[ei];
+              var ruleKey = err.rule || 'unknown';
+              if (!stats.fieldErrors[fn].byRule[ruleKey]) {
+                stats.fieldErrors[fn].byRule[ruleKey] = { count: 0, message: err.message };
+              }
+              stats.fieldErrors[fn].byRule[ruleKey].count++;
+              if (!stats.ruleCounts[ruleKey]) {
+                stats.ruleCounts[ruleKey] = { count: 0, sampleMessage: err.message };
+              }
+              stats.ruleCounts[ruleKey].count++;
+            }
+          }
+          if (this._asyncResults && this._asyncResults[fn]
+            && this._asyncResults[fn].errors && this._asyncResults[fn].errors.length > 0) {
+            if (!stats.fieldAsyncFailures[fn]) {
+              stats.fieldAsyncFailures[fn] = { label: (this.fields[fn] && this.fields[fn].label) || fn, total: 0, byReason: {} };
+            }
+            var asyncErrs = this._asyncResults[fn].errors;
+            stats.fieldAsyncFailures[fn].total += asyncErrs.length;
+            for (var aei = 0; aei < asyncErrs.length; aei++) {
+              var aerr = asyncErrs[aei];
+              var reasonKey = aerr.rule || 'async_unknown';
+              if (!stats.fieldAsyncFailures[fn].byReason[reasonKey]) {
+                stats.fieldAsyncFailures[fn].byReason[reasonKey] = { count: 0, message: aerr.message };
+              }
+              stats.fieldAsyncFailures[fn].byReason[reasonKey].count++;
+            }
+          }
+        }
+      }
+    }
+    for (var gn in this.groups) {
+      if (this.groups.hasOwnProperty(gn)) {
+        var fieldsInGroup = this.groups[gn] || [];
+        var groupErrorCount = 0;
+        for (var gi = 0; gi < fieldsInGroup.length; gi++) {
+          var gfn = fieldsInGroup[gi];
+          if (summary.fieldResults && summary.fieldResults[gfn] && summary.fieldResults[gfn].errors) {
+            groupErrorCount += summary.fieldResults[gfn].errors.length;
+          }
+        }
+        if (!stats.groupErrors[gn]) stats.groupErrors[gn] = 0;
+        stats.groupErrors[gn] += groupErrorCount;
+      }
+    }
+    for (var si = 0; si < this.stepOrder.length; si++) {
+      var sName = this.stepOrder[si];
+      var step = this.steps[sName];
+      if (step && step.fields) {
+        var stepErrorCount = 0;
+        for (var sfi = 0; sfi < step.fields.length; sfi++) {
+          var sfn = step.fields[sfi];
+          if (summary.fieldResults && summary.fieldResults[sfn] && summary.fieldResults[sfn].errors) {
+            stepErrorCount += summary.fieldResults[sfn].errors.length;
+          }
+        }
+        if (!stats.stepErrors[sName]) stats.stepErrors[sName] = { label: step.label || sName, total: 0 };
+        stats.stepErrors[sName].total += stepErrorCount;
+      }
+    }
+  };
+
+  FormValidator.prototype.getMonitoringStats = function (options) {
+    options = options || {};
+    var stats = GLOBAL_MONITORING_STATS;
+    var topFieldErrors = [];
+    for (var fn in stats.fieldErrors) {
+      if (stats.fieldErrors.hasOwnProperty(fn)) {
+        topFieldErrors.push({
+          field: fn,
+          label: stats.fieldErrors[fn].label,
+          total: stats.fieldErrors[fn].total,
+          byRule: stats.fieldErrors[fn].byRule
+        });
+      }
+    }
+    topFieldErrors.sort(function (a, b) { return b.total - a.total; });
+    if (typeof options.topN === 'number') topFieldErrors = topFieldErrors.slice(0, options.topN);
+    var topAsyncFailures = [];
+    for (var afn in stats.fieldAsyncFailures) {
+      if (stats.fieldAsyncFailures.hasOwnProperty(afn)) {
+        topAsyncFailures.push({
+          field: afn,
+          label: stats.fieldAsyncFailures[afn].label,
+          total: stats.fieldAsyncFailures[afn].total,
+          byReason: stats.fieldAsyncFailures[afn].byReason
+        });
+      }
+    }
+    topAsyncFailures.sort(function (a, b) { return b.total - a.total; });
+    if (typeof options.topN === 'number') topAsyncFailures = topAsyncFailures.slice(0, options.topN);
+    var topRules = [];
+    for (var rk in stats.ruleCounts) {
+      if (stats.ruleCounts.hasOwnProperty(rk)) {
+        topRules.push({
+          rule: rk,
+          count: stats.ruleCounts[rk].count,
+          sampleMessage: stats.ruleCounts[rk].sampleMessage
+        });
+      }
+    }
+    topRules.sort(function (a, b) { return b.count - a.count; });
+    if (typeof options.topN === 'number') topRules = topRules.slice(0, options.topN);
+    var groupStats = [];
+    for (var gn in stats.groupErrors) {
+      if (stats.groupErrors.hasOwnProperty(gn)) groupStats.push({ group: gn, total: stats.groupErrors[gn] });
+    }
+    groupStats.sort(function (a, b) { return b.total - a.total; });
+    var stepStats = [];
+    for (var sn in stats.stepErrors) {
+      if (stats.stepErrors.hasOwnProperty(sn)) {
+        stepStats.push({ step: sn, label: stats.stepErrors[sn].label, total: stats.stepErrors[sn].total });
+      }
+    }
+    stepStats.sort(function (a, b) { return b.total - a.total; });
+    var trackingPayload = {
+      event: 'form_validation_summary',
+      timestamp: new Date().toISOString(),
+      totalSubmissions: stats.totalSubmissions,
+      totalErrors: stats.totalErrors,
+      avgErrorsPerSubmission: stats.totalSubmissions > 0
+        ? Math.round((stats.totalErrors / stats.totalSubmissions) * 100) / 100 : 0,
+      topFieldErrors: topFieldErrors.map(function (fe) {
+        return { field: fe.field, label: fe.label, total: fe.total };
+      }),
+      topAsyncFailures: topAsyncFailures.map(function (af) {
+        return { field: af.field, label: af.label, total: af.total };
+      }),
+      topRules: topRules
+    };
+    return {
+      totalSubmissions: stats.totalSubmissions,
+      totalErrors: stats.totalErrors,
+      avgErrorsPerSubmission: trackingPayload.avgErrorsPerSubmission,
+      topFieldErrors: topFieldErrors,
+      topAsyncFailures: topAsyncFailures,
+      topRules: topRules,
+      groupStats: groupStats,
+      stepStats: stepStats,
+      lastUpdatedAt: stats.lastUpdatedAt,
+      trackingPayload: trackingPayload
+    };
   };
 
   function deepClone(obj) {
