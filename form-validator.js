@@ -11,6 +11,13 @@
     INFO: 'info'
   };
 
+  var VALIDATE_STATUS = {
+    PENDING: 'pending',
+    VALIDATING: 'validating',
+    SUCCESS: 'success',
+    ERROR: 'error'
+  };
+
   var BUILTIN_RULES = {
     name: {
       type: 'name',
@@ -46,7 +53,8 @@
       message: {
         required: '请选择日期',
         format: '日期格式不正确，请使用YYYY-MM-DD格式',
-        invalid: '请输入有效的日期'
+        invalid: '请输入有效的日期',
+        notExist: '该日期不存在，请检查'
       },
       severity: SEVERITY.ERROR
     },
@@ -59,10 +67,13 @@
       precision: 2,
       message: {
         required: '请输入金额',
-        min: '金额不能小于0.01元',
-        max: '金额不能超过99,999,999.99元',
-        precision: '金额最多保留2位小数',
-        pattern: '请输入有效的数字金额'
+        min: '金额不能小于{min}元',
+        max: '金额不能超过{max}元',
+        precision: '金额最多保留{precision}位小数',
+        pattern: '请输入有效的数字金额',
+        hasLetter: '金额不能包含字母',
+        multipleDots: '金额不能有多个小数点',
+        hasSpace: '金额不能包含空格'
       },
       severity: SEVERITY.ERROR
     },
@@ -74,8 +85,8 @@
       maxLength: 200,
       message: {
         required: '请输入详细地址',
-        minLength: '地址至少需要5个字符',
-        maxLength: '地址不能超过200个字符'
+        minLength: '地址至少需要{minLength}个字符',
+        maxLength: '地址不能超过{maxLength}个字符'
       },
       severity: SEVERITY.ERROR
     },
@@ -101,17 +112,24 @@
     this.warnings = {};
     this.groups = {};
     this.fieldValues = {};
+    this.fieldStatus = {};
     this.lastSummary = null;
     this.summaryStorageKey = options.summaryStorageKey || 'form_validator_last_summary';
     this.customRules = {};
     this.onFieldValidate = options.onFieldValidate || null;
     this.onFormValidate = options.onFormValidate || null;
+    this.onAsyncFieldValidate = options.onAsyncFieldValidate || null;
     this.locale = options.locale || 'zh-CN';
     this.enableSummaryPersistence = options.enableSummaryPersistence !== false;
+    this.defaultDebounce = options.defaultDebounce !== undefined ? options.defaultDebounce : 300;
+    this._asyncTimers = {};
+    this._asyncRequestId = {};
+    this._asyncResults = {};
   }
 
   FormValidator.SEVERITY = SEVERITY;
   FormValidator.BUILTIN_RULES = BUILTIN_RULES;
+  FormValidator.VALIDATE_STATUS = VALIDATE_STATUS;
 
   FormValidator.prototype.registerField = function (fieldName, config) {
     if (!fieldName || typeof fieldName !== 'string') {
@@ -126,6 +144,7 @@
     ruleConfig.name = fieldName;
     ruleConfig.label = ruleConfig.label || fieldName;
     ruleConfig.severity = ruleConfig.severity || SEVERITY.ERROR;
+    ruleConfig.debounce = ruleConfig.debounce !== undefined ? ruleConfig.debounce : this.defaultDebounce;
     if (ruleConfig.group) {
       if (!this.groups[ruleConfig.group]) {
         this.groups[ruleConfig.group] = [];
@@ -137,6 +156,7 @@
     this.fields[fieldName] = ruleConfig;
     this.errors[fieldName] = [];
     this.warnings[fieldName] = [];
+    this.fieldStatus[fieldName] = VALIDATE_STATUS.PENDING;
     return this;
   };
 
@@ -189,7 +209,7 @@
           errors.push(typeErrors[i]);
         }
       }
-      if (field.customRules && field.customRules.length > 0) {
+      if (field.customRules && field.customRules.length > 0 && errors.length === 0) {
         for (var j = 0; j < field.customRules.length; j++) {
           var customRuleName = field.customRules[j];
           var customRule = this.customRules[customRuleName];
@@ -207,7 +227,7 @@
           }
         }
       }
-      if (field.validator && typeof field.validator === 'function') {
+      if (field.validator && typeof field.validator === 'function' && errors.length === 0) {
         try {
           var result = field.validator(value, this.fieldValues, field);
           if (result === false) {
@@ -220,7 +240,9 @@
               var err = this._createError(fieldName, result.rule || 'custom', result.message || '校验不通过', sev);
               if (sev === SEVERITY.WARNING) {
                 warnings.push(err);
-              } else { errors.push(err); }
+              } else {
+                errors.push(err);
+              }
             }
           }
         } catch (e) {
@@ -230,18 +252,181 @@
     }
     this.errors[fieldName] = errors;
     this.warnings[fieldName] = warnings;
-    var result = {
+    this.fieldStatus[fieldName] = errors.length === 0 ? VALIDATE_STATUS.SUCCESS : VALIDATE_STATUS.ERROR;
+    var resultObj = {
       valid: errors.length === 0,
       errors: errors,
       warnings: warnings,
       field: fieldName,
       value: value,
+      status: this.fieldStatus[fieldName],
       timestamp: Date.now()
     };
     if (this.onFieldValidate && typeof this.onFieldValidate === 'function') {
-      this.onFieldValidate(result);
+      this.onFieldValidate(resultObj);
     }
-    return result;
+    return resultObj;
+  };
+
+  FormValidator.prototype.validateFieldAsync = function (fieldName, value) {
+    var self = this;
+    var field = this.fields[fieldName];
+    if (!field) {
+      return Promise.resolve({ valid: true, errors: [], warnings: [], field: fieldName, async: false });
+    }
+    if (typeof value !== 'undefined') {
+      this.fieldValues[fieldName] = value;
+    }
+    var syncResult = this.validateField(fieldName);
+    if (!syncResult.valid) {
+      return Promise.resolve(syncResult);
+    }
+    if (!field.asyncValidator || typeof field.asyncValidator !== 'function') {
+      return Promise.resolve(syncResult);
+    }
+    this.fieldStatus[fieldName] = VALIDATE_STATUS.VALIDATING;
+    if (this._asyncTimers[fieldName]) {
+      clearTimeout(this._asyncTimers[fieldName]);
+    }
+    var currentValue = this.fieldValues[fieldName];
+    if (!this._asyncRequestId[fieldName]) {
+      this._asyncRequestId[fieldName] = 0;
+    }
+    this._asyncRequestId[fieldName]++;
+    var requestId = this._asyncRequestId[fieldName];
+    return new Promise(function (resolve) {
+      var debounceMs = field.debounce !== undefined ? field.debounce : self.defaultDebounce;
+      self._asyncTimers[fieldName] = setTimeout(function () {
+        var fieldConfig = self.fields[fieldName];
+        if (!fieldConfig || !fieldConfig.asyncValidator) {
+          resolve(syncResult);
+          return;
+        }
+        try {
+          var asyncResult = fieldConfig.asyncValidator(currentValue, self.fieldValues, fieldConfig);
+          if (asyncResult && typeof asyncResult.then === 'function') {
+            asyncResult.then(function (res) {
+              if (requestId !== self._asyncRequestId[fieldName]) {
+                return;
+              }
+              self._handleAsyncResult(fieldName, currentValue, res, syncResult, requestId);
+              var finalResult = self._buildAsyncResult(fieldName, currentValue, syncResult);
+              resolve(finalResult);
+            }).catch(function (err) {
+              if (requestId !== self._asyncRequestId[fieldName]) {
+                return;
+              }
+              self._handleAsyncError(fieldName, currentValue, err, syncResult);
+              var finalResult = self._buildAsyncResult(fieldName, currentValue, syncResult);
+              resolve(finalResult);
+            });
+          } else {
+            if (requestId !== self._asyncRequestId[fieldName]) {
+              return;
+            }
+            self._handleAsyncResult(fieldName, currentValue, asyncResult, syncResult, requestId);
+            var finalResult = self._buildAsyncResult(fieldName, currentValue, syncResult);
+            resolve(finalResult);
+          }
+        } catch (e) {
+          if (requestId !== self._asyncRequestId[fieldName]) {
+            return;
+          }
+          self._handleAsyncError(fieldName, currentValue, e, syncResult);
+          var finalResult = self._buildAsyncResult(fieldName, currentValue, syncResult);
+          resolve(finalResult);
+        }
+      }, debounceMs);
+      if (self.onAsyncFieldValidate && typeof self.onAsyncFieldValidate === 'function') {
+        self.onAsyncFieldValidate({
+          field: fieldName,
+          status: VALIDATE_STATUS.VALIDATING,
+          value: currentValue
+        });
+      }
+    });
+  };
+
+  FormValidator.prototype._handleAsyncResult = function (fieldName, value, asyncResult, syncResult, requestId) {
+    var field = this.fields[fieldName];
+    var asyncErrors = [];
+    var asyncWarnings = [];
+    if (asyncResult === false) {
+      asyncErrors.push(this._createError(fieldName, 'async',
+        field.message && field.message.async ? field.message.async : '校验不通过',
+        field.severity));
+    } else if (typeof asyncResult === 'string') {
+      asyncErrors.push(this._createError(fieldName, 'async', asyncResult, field.severity));
+    } else if (asyncResult && typeof asyncResult === 'object') {
+      if (asyncResult.valid === false) {
+        var sev = asyncResult.severity || field.severity;
+        var err = this._createError(fieldName, asyncResult.rule || 'async',
+          asyncResult.message || '校验不通过', sev);
+        if (sev === SEVERITY.WARNING) {
+          asyncWarnings.push(err);
+        } else {
+          asyncErrors.push(err);
+        }
+      }
+    }
+    var allErrors = (syncResult.errors || []).concat(asyncErrors);
+    var allWarnings = (syncResult.warnings || []).concat(asyncWarnings);
+    this.errors[fieldName] = allErrors;
+    this.warnings[fieldName] = allWarnings;
+    this._asyncResults[fieldName] = {
+      value: value,
+      valid: asyncErrors.length === 0,
+      errors: asyncErrors,
+      warnings: asyncWarnings,
+      requestId: requestId
+    };
+    this.fieldStatus[fieldName] = allErrors.length === 0 ? VALIDATE_STATUS.SUCCESS : VALIDATE_STATUS.ERROR;
+    var resultObj = {
+      valid: allErrors.length === 0,
+      errors: allErrors,
+      warnings: allWarnings,
+      field: fieldName,
+      value: value,
+      status: this.fieldStatus[fieldName],
+      async: true,
+      timestamp: Date.now()
+    };
+    if (this.onFieldValidate && typeof this.onFieldValidate === 'function') {
+      this.onFieldValidate(resultObj);
+    }
+  };
+
+  FormValidator.prototype._handleAsyncError = function (fieldName, value, error, syncResult) {
+    var field = this.fields[fieldName];
+    var errMsg = error && error.message ? error.message : '异步校验失败';
+    var asyncErr = this._createError(fieldName, 'async', errMsg, SEVERITY.ERROR);
+    var allErrors = (syncResult.errors || []).concat([asyncErr]);
+    var allWarnings = syncResult.warnings || [];
+    this.errors[fieldName] = allErrors;
+    this.warnings[fieldName] = allWarnings;
+    this.fieldStatus[fieldName] = VALIDATE_STATUS.ERROR;
+    this._asyncResults[fieldName] = {
+      value: value,
+      valid: false,
+      errors: [asyncErr],
+      warnings: [],
+      error: error
+    };
+  };
+
+  FormValidator.prototype._buildAsyncResult = function (fieldName, value, syncResult) {
+    var errors = this.errors[fieldName] || syncResult.errors || [];
+    var warnings = this.warnings[fieldName] || syncResult.warnings || [];
+    return {
+      valid: errors.length === 0,
+      errors: errors,
+      warnings: warnings,
+      field: fieldName,
+      value: value,
+      status: this.fieldStatus[fieldName],
+      async: true,
+      timestamp: Date.now()
+    };
   };
 
   FormValidator.prototype.validateAll = function (values) {
@@ -250,9 +435,10 @@
     var fieldResults = {};
     var hasError = false;
     var fieldsToValidate = [];
+    var vals = values || this.fieldValues;
     for (var fieldName in this.fields) {
       if (this.fields.hasOwnProperty(fieldName)) {
-        if (this._isFieldVisible(fieldName, values || this.fieldValues)) {
+        if (this._isFieldVisible(fieldName, vals)) {
           fieldsToValidate.push(fieldName);
         }
       }
@@ -270,10 +456,24 @@
         allWarnings = allWarnings.concat(result.warnings);
       }
     }
-    var duplicateErrors = this._detectDuplicates(values || this.fieldValues);
-    allErrors = allErrors.concat(duplicateErrors);
+    var duplicateErrors = this._detectDuplicates(vals);
+    for (var k = 0; k < duplicateErrors.length; k++) {
+      var dupErr = duplicateErrors[k];
+      var dupField = dupErr.field;
+      if (this.errors[dupField]) {
+        this.errors[dupField].push(dupErr);
+      }
+      allErrors.push(dupErr);
+    }
     if (duplicateErrors.length > 0) {
       hasError = true;
+      for (var df = 0; df < duplicateErrors.length; df++) {
+        var dupFieldName = duplicateErrors[df].field;
+        if (fieldResults[dupFieldName]) {
+          fieldResults[dupFieldName].errors.push(duplicateErrors[df]);
+          fieldResults[dupFieldName].valid = fieldResults[dupFieldName].errors.length === 0;
+        }
+      }
     }
     var summary = {
       valid: !hasError,
@@ -294,6 +494,47 @@
       this.onFormValidate(summary);
     }
     return summary;
+  };
+
+  FormValidator.prototype.validateAllAsync = function (values) {
+    var self = this;
+    var syncSummary = this.validateAll(values);
+    if (syncSummary.valid === false) {
+      return Promise.resolve(syncSummary);
+    }
+    var asyncFields = [];
+    var vals = values || this.fieldValues;
+    for (var fieldName in this.fields) {
+      if (this.fields.hasOwnProperty(fieldName)) {
+        var field = this.fields[fieldName];
+        if (field.asyncValidator && typeof field.asyncValidator === 'function' && this._isFieldVisible(fieldName, vals)) {
+          asyncFields.push(fieldName);
+        }
+      }
+    }
+    if (asyncFields.length === 0) {
+      return Promise.resolve(syncSummary);
+    }
+    var promises = [];
+    for (var i = 0; i < asyncFields.length; i++) {
+      var fn = asyncFields[i];
+      promises.push(this.validateFieldAsync(fn));
+    }
+    return Promise.all(promises).then(function () {
+      var finalSummary = self.validateAll(vals);
+      var hasAsyncError = false;
+      for (var j = 0; j < asyncFields.length; j++) {
+        var afn = asyncFields[j];
+        var asyncResult = self._asyncResults[afn];
+        if (asyncResult && !asyncResult.valid) {
+          hasAsyncError = true;
+        }
+      }
+      if (hasAsyncError) {
+        finalSummary.valid = false;
+      }
+      return finalSummary;
+    });
   };
 
   FormValidator.prototype.setFieldValue = function (fieldName, value) {
@@ -320,10 +561,16 @@
     return this.warnings[fieldName] || [];
   };
 
+  FormValidator.prototype.getFieldStatus = function (fieldName) {
+    return this.fieldStatus[fieldName] || VALIDATE_STATUS.PENDING;
+  };
+
   FormValidator.prototype.getAllErrors = function () {
     var allErrors = [];
-    for (var fieldName in this.errors) {
-      if (this.errors.hasOwnProperty(fieldName)) {
+    var fieldOrder = this._getFieldOrder();
+    for (var i = 0; i < fieldOrder.length; i++) {
+      var fieldName = fieldOrder[i];
+      if (this.errors[fieldName] && this.errors[fieldName].length > 0) {
         allErrors = allErrors.concat(this.errors[fieldName]);
       }
     }
@@ -332,12 +579,18 @@
 
   FormValidator.prototype.getAllWarnings = function () {
     var allWarnings = [];
-    for (var fieldName in this.warnings) {
-      if (this.warnings.hasOwnProperty(fieldName)) {
+    var fieldOrder = this._getFieldOrder();
+    for (var i = 0; i < fieldOrder.length; i++) {
+      var fieldName = fieldOrder[i];
+      if (this.warnings[fieldName] && this.warnings[fieldName].length > 0) {
         allWarnings = allWarnings.concat(this.warnings[fieldName]);
       }
     }
     return allWarnings;
+  };
+
+  FormValidator.prototype._getFieldOrder = function () {
+    return Object.keys(this.fields);
   };
 
   FormValidator.prototype.getFirstError = function () {
@@ -349,6 +602,13 @@
     if (fieldName) {
       this.errors[fieldName] = [];
       this.warnings[fieldName] = [];
+      this.fieldStatus[fieldName] = VALIDATE_STATUS.PENDING;
+      this._asyncResults[fieldName] = null;
+      if (this._asyncTimers[fieldName]) {
+        clearTimeout(this._asyncTimers[fieldName]);
+        this._asyncTimers[fieldName] = null;
+      }
+      this._asyncRequestId[fieldName] = 0;
     } else {
       for (var fn in this.errors) {
         if (this.errors.hasOwnProperty(fn)) {
@@ -360,12 +620,50 @@
           this.warnings[fw] = [];
         }
       }
+      for (var fs in this.fieldStatus) {
+        if (this.fieldStatus.hasOwnProperty(fs)) {
+          this.fieldStatus[fs] = VALIDATE_STATUS.PENDING;
+        }
+      }
+      for (var at in this._asyncTimers) {
+        if (this._asyncTimers.hasOwnProperty(at) && this._asyncTimers[at]) {
+          clearTimeout(this._asyncTimers[at]);
+        }
+      }
+      this._asyncTimers = {};
+      this._asyncRequestId = {};
+      this._asyncResults = {};
     }
     return this;
   };
 
   FormValidator.prototype.clearAllStatus = function () {
     return this.clearFieldStatus();
+  };
+
+  FormValidator.prototype.cancelAsyncValidation = function (fieldName) {
+    if (fieldName) {
+      if (this._asyncTimers[fieldName]) {
+        clearTimeout(this._asyncTimers[fieldName]);
+        this._asyncTimers[fieldName] = null;
+      }
+      if (this._asyncRequestId[fieldName]) {
+        this._asyncRequestId[fieldName]++;
+      }
+    } else {
+      for (var fn in this._asyncTimers) {
+        if (this._asyncTimers.hasOwnProperty(fn) && this._asyncTimers[fn]) {
+          clearTimeout(this._asyncTimers[fn]);
+        }
+      }
+      this._asyncTimers = {};
+      for (var key in this._asyncRequestId) {
+        if (this._asyncRequestId.hasOwnProperty(key)) {
+          this._asyncRequestId[key]++;
+        }
+      }
+    }
+    return this;
   };
 
   FormValidator.prototype.calculateProgress = function (values) {
@@ -448,8 +746,8 @@
           if (field.required && this._isEmpty(value)) {
             isIncomplete = true;
           } else if (!this._isEmpty(value)) {
-            var r = this.validateField(fieldName, value);
-            if (!r.valid) {
+            var fieldErrors = this.errors[fieldName] || [];
+            if (fieldErrors.length > 0) {
               isIncomplete = true;
             }
           }
@@ -458,7 +756,8 @@
               field: fieldName,
               label: field.label,
               errors: this.errors[fieldName] || [],
-              isEmpty: this._isEmpty(value)
+              isEmpty: this._isEmpty(value),
+              status: this.fieldStatus[fieldName]
             });
           }
         }
@@ -487,7 +786,8 @@
         label: field.label,
         message: error.message,
         suggestion: this._generateSuggestionText(error, field),
-        severity: error.severity
+        severity: error.severity,
+        rule: error.rule
       };
       suggestions.push(suggestion);
     }
@@ -529,14 +829,82 @@
     return Object.keys(this.groups);
   };
 
+  FormValidator.prototype.exportSchema = function () {
+    var schema = {
+      version: '1.0',
+      locale: this.locale,
+      defaultDebounce: this.defaultDebounce,
+      groups: deepClone(this.groups),
+      fields: {},
+      customRules: []
+    };
+    for (var fieldName in this.fields) {
+      if (this.fields.hasOwnProperty(fieldName)) {
+        var fieldConfig = deepClone(this.fields[fieldName]);
+        if (fieldConfig.pattern && fieldConfig.pattern instanceof RegExp) {
+          fieldConfig.pattern = {
+            __type: 'RegExp',
+            source: fieldConfig.pattern.source,
+            flags: fieldConfig.pattern.flags
+          };
+        }
+        delete fieldConfig.validator;
+        delete fieldConfig.asyncValidator;
+        delete fieldConfig.name;
+        schema.fields[fieldName] = fieldConfig;
+      }
+    }
+    for (var ruleName in this.customRules) {
+      if (this.customRules.hasOwnProperty(ruleName)) {
+        schema.customRules.push({
+          name: ruleName,
+          message: this.customRules[ruleName].message
+        });
+      }
+    }
+    return schema;
+  };
+
+  FormValidator.prototype.importSchema = function (schema, options) {
+    if (!schema || typeof schema !== 'object') {
+      throw new Error('Schema 不能为空');
+    }
+    options = options || {};
+    if (options.reset !== false) {
+      this.reset();
+    }
+    if (schema.locale) {
+      this.locale = schema.locale;
+    }
+    if (schema.defaultDebounce !== undefined) {
+      this.defaultDebounce = schema.defaultDebounce;
+    }
+    if (schema.fields && typeof schema.fields === 'object') {
+      for (var fieldName in schema.fields) {
+        if (schema.fields.hasOwnProperty(fieldName)) {
+          var fieldConfig = deepClone(schema.fields[fieldName]);
+          if (fieldConfig.pattern && fieldConfig.pattern.__type === 'RegExp') {
+            fieldConfig.pattern = new RegExp(fieldConfig.pattern.source, fieldConfig.pattern.flags);
+          }
+          this.registerField(fieldName, fieldConfig);
+        }
+      }
+    }
+    return this;
+  };
+
   FormValidator.prototype.reset = function () {
     this.fields = {};
     this.errors = {};
     this.warnings = {};
     this.groups = {};
     this.fieldValues = {};
+    this.fieldStatus = {};
     this.lastSummary = null;
     this.customRules = {};
+    this._asyncTimers = {};
+    this._asyncRequestId = {};
+    this._asyncResults = {};
     return this;
   };
 
@@ -625,23 +993,37 @@
         return errors;
       }
     }
-    var dateObj = new Date(strValue);
+    var parsedDate = this._parseDate(strValue, field.format);
+    if (!parsedDate) {
+      errors.push(this._createError(field.name, 'invalid',
+        this._getMessage(field, 'invalid'),
+        field.severity));
+      return errors;
+    }
+    if (!this._isValidDate(parsedDate.year, parsedDate.month, parsedDate.day)) {
+      errors.push(this._createError(field.name, 'notExist',
+        this._getMessage(field, 'notExist'),
+        field.severity));
+      return errors;
+    }
+    var dateObj = new Date(parsedDate.year, parsedDate.month - 1, parsedDate.day);
     if (isNaN(dateObj.getTime())) {
       errors.push(this._createError(field.name, 'invalid',
         this._getMessage(field, 'invalid'),
         field.severity));
+      return errors;
     }
     if (field.minDate) {
-      var minDate = new Date(field.minDate);
-      if (dateObj < minDate) {
+      var minDateObj = new Date(field.minDate);
+      if (dateObj < minDateObj) {
         errors.push(this._createError(field.name, 'minDate',
           '日期不能早于' + field.minDate,
           field.severity));
       }
     }
     if (field.maxDate) {
-      var maxDate = new Date(field.maxDate);
-      if (dateObj > maxDate) {
+      var maxDateObj = new Date(field.maxDate);
+      if (dateObj > maxDateObj) {
         errors.push(this._createError(field.name, 'maxDate',
           '日期不能晚于' + field.maxDate,
           field.severity));
@@ -650,9 +1032,82 @@
     return errors;
   };
 
+  FormValidator.prototype._parseDate = function (strValue, format) {
+    var match;
+    switch (format) {
+      case 'YYYY-MM-DD':
+        match = strValue.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (match) {
+          return { year: parseInt(match[1], 10), month: parseInt(match[2], 10), day: parseInt(match[3], 10) };
+        }
+        break;
+      case 'YYYY/MM/DD':
+        match = strValue.match(/^(\d{4})\/(\d{2})\/(\d{2})$/);
+        if (match) {
+          return { year: parseInt(match[1], 10), month: parseInt(match[2], 10), day: parseInt(match[3], 10) };
+        }
+        break;
+      case 'MM-DD-YYYY':
+        match = strValue.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+        if (match) {
+          return { year: parseInt(match[3], 10), month: parseInt(match[1], 10), day: parseInt(match[2], 10) };
+        }
+        break;
+      case 'DD-MM-YYYY':
+        match = strValue.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+        if (match) {
+          return { year: parseInt(match[3], 10), month: parseInt(match[2], 10), day: parseInt(match[1], 10) };
+        }
+        break;
+      default:
+        return null;
+    }
+    return null;
+  };
+
+  FormValidator.prototype._isValidDate = function (year, month, day) {
+    if (month < 1 || month > 12) return false;
+    if (day < 1 || day > 31) return false;
+    var daysInMonth = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (this._isLeapYear(year)) {
+      daysInMonth[1] = 29;
+    }
+    return day <= daysInMonth[month - 1];
+  };
+
+  FormValidator.prototype._isLeapYear = function (year) {
+    return (year % 4 === 0 && year % 100 !== 0) || (year % 400 === 0);
+  };
+
   FormValidator.prototype._validateAmount = function (field, value) {
     var errors = [];
-    var numValue = parseFloat(value);
+    var strValue = String(value);
+    if (/\s/.test(strValue)) {
+      errors.push(this._createError(field.name, 'hasSpace',
+        this._getMessage(field, 'hasSpace'),
+        field.severity));
+      return errors;
+    }
+    if (/[a-zA-Z\u4e00-\u9fa5]/.test(strValue)) {
+      errors.push(this._createError(field.name, 'hasLetter',
+        this._getMessage(field, 'hasLetter'),
+        field.severity));
+      return errors;
+    }
+    var dotCount = (strValue.match(/\./g) || []).length;
+    if (dotCount > 1) {
+      errors.push(this._createError(field.name, 'multipleDots',
+        this._getMessage(field, 'multipleDots'),
+        field.severity));
+      return errors;
+    }
+    if (!/^-?\d*\.?\d+$/.test(strValue) && !/^-?\d+\.?\d*$/.test(strValue)) {
+      errors.push(this._createError(field.name, 'pattern',
+        this._getMessage(field, 'pattern'),
+        field.severity));
+      return errors;
+    }
+    var numValue = parseFloat(strValue);
     if (isNaN(numValue)) {
       errors.push(this._createError(field.name, 'pattern',
         this._getMessage(field, 'pattern'),
@@ -670,9 +1125,8 @@
         field.severity));
     }
     if (field.precision !== undefined) {
-      var strVal = String(value);
-      var decimalIndex = strVal.indexOf('.');
-      if (decimalIndex !== -1 && strVal.slice(decimalIndex + 1).length > field.precision) {
+      var decimalIndex = strValue.indexOf('.');
+      if (decimalIndex !== -1 && strValue.slice(decimalIndex + 1).length > field.precision) {
         errors.push(this._createError(field.name, 'precision',
           this._formatMessage(this._getMessage(field, 'precision'), { precision: field.precision }),
           field.severity));
@@ -764,7 +1218,7 @@
     var duplicateCheckFields = [];
     for (var fieldName in this.fields) {
       if (this.fields.hasOwnProperty(fieldName)) {
-        if (this.fields[fieldName].unique) {
+        if (this.fields[fieldName].unique && this._isFieldVisible(fieldName, values)) {
           duplicateCheckFields.push(fieldName);
         }
       }
@@ -888,10 +1342,15 @@
       max: field.label + '数值太大，请减小数值',
       format: '请按照正确格式填写' + field.label,
       invalid: field.label + '无效，请重新输入',
+      notExist: field.label + '不存在，请检查日期的月日是否正确',
       minCount: '请至少选择' + (field.minCount || 1) + '个' + field.label,
       maxCount: '最多只能选择' + field.maxCount + '个' + field.label,
       unique: field.label + '不能与其他字段重复，请修改',
-      precision: field.label + '小数位数过多，请调整'
+      precision: field.label + '小数位数过多，请调整',
+      hasLetter: field.label + '不能包含字母或文字，请只输入数字',
+      multipleDots: field.label + '不能有多个小数点，请检查',
+      hasSpace: field.label + '不能包含空格，请移除空格后重试',
+      async: '请等待' + field.label + '校验完成'
     };
     return suggestions[error.rule] || '请修正' + field.label + '字段';
   };
@@ -901,8 +1360,7 @@
       if (typeof localStorage !== 'undefined') {
         localStorage.setItem(this.summaryStorageKey, JSON.stringify(summary));
       }
-    } catch (e) {
-    }
+    } catch (e) {}
   };
 
   FormValidator.prototype._loadSummary = function () {
@@ -913,8 +1371,7 @@
           return JSON.parse(data);
         }
       }
-    } catch (e) {
-    }
+    } catch (e) {}
     return null;
   };
 
